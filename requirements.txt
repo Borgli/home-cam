@@ -1,0 +1,40 @@
+# Core Dependencies
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-multipart==0.0.12
+python-socketio==5.11.4
+aiofiles==24.1.0
+
+# Database
+sqlalchemy==2.0.35
+aiosqlite==0.20.0
+alembic==1.13.3
+redis==5.2.0
+
+# Computer Vision
+opencv-python==4.11.0.86
+ultralytics==8.3.0
+torch==2.5.0
+torchvision==0.20.0
+numpy==2.3.4
+
+# LLM & AI
+langchain==0.3.7
+langchain-community==0.3.7
+langchain-huggingface==0.1.2
+transformers==4.46.0
+sentence-transformers==3.3.0
+
+# Web Framework
+flask==3.1.0
+
+# Utilities
+python-dotenv==1.0.1
+pydantic==2.9.2
+pydantic-settings==2.6.0
+websockets==13.1
+Pillow==11.0.0
+requests==2.32.3
+supervision==0.27.0
+reolinkapi==0.1.0
+
