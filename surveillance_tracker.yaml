@@ -1,0 +1,13 @@
+# BoT-SORT tracker config optimized for fixed surveillance cameras
+tracker_type: botsort
+track_high_thresh: 0.3        # High confidence threshold for first-frame associations
+track_low_thresh: 0.1         # Low confidence threshold for second-round matching
+new_track_thresh: 0.3         # Minimum confidence to start a new track
+track_buffer: 90              # ~8 seconds at 11fps - keep lost tracks in memory
+match_thresh: 0.75            # IoU matching threshold
+fuse_score: true              # Fuse detection confidence into matching cost
+gmc_method: none              # No motion compensation - cameras are fixed
+with_reid: true               # Appearance-based re-identification (the key feature)
+model: auto                   # Reuse YOLO backbone features - zero extra overhead
+proximity_thresh: 0.3         # Spatial proximity threshold for Re-ID
+appearance_thresh: 0.5        # Appearance similarity threshold for Re-ID

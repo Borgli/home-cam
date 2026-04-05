@@ -1,293 +1,236 @@
-# 🎥 Home Camera Surveillance System
+# Home Camera Surveillance System
 
-AI-powered surveillance system with real-time object detection for Reolink NVR cameras.
+AI-powered surveillance system with real-time object detection, tracking, and a modern React dashboard for Reolink NVR cameras.
 
-## ✨ Features
+## Features
 
-- **Real-time Object Detection** - YOLOv11 with live bounding boxes
-- **Multi-Camera Support** - Monitor up to 4 NVR channels simultaneously
-- **Always-On Streams** - Cameras accessible on-demand via NVR
-- **Detection Recording** - SQLite database for all detections
-- **AI Chat Assistant** - Query surveillance data with natural language
-- **Web Interface** - Beautiful neon-themed UI with live feeds
-- **REST API** - Full FastAPI backend with automatic documentation
+- **YOLO26 Object Detection** - Real-time detection with 80 COCO classes on live camera feeds
+- **BoT-SORT Tracking with Re-ID** - Appearance-based re-identification so tracked objects keep their IDs even after temporary occlusion
+- **4-Camera Grid** - Monitor up to 4 NVR channels simultaneously with zoom and fullscreen
+- **Drawing Tools** - Privacy zones, counting zones, and crossing lines drawn directly on camera feeds
+- **Privacy Zone Masking** - Drawn privacy zones are applied server-side before detection, truly hiding regions from YOLO
+- **Movement Trails** - TraceAnnotator draws motion paths behind tracked objects
+- **Detection Smoothing** - DetectionsSmoother reduces bounding box jitter
+- **SQLite Persistence** - All detections stored with timestamps, bounding boxes, class, confidence, and tracker IDs
+- **SQL Query Editor** - Write and execute SELECT queries against the detection database
+- **AI-Powered Queries** - Natural language to SQL via Ollama + Gemma 4 E2B (local, private)
+- **Real-time Event Log** - Scrolling detection feed with confidence bars
+- **Analytics Dashboard** - Recharts-based FPS, batch time, efficiency, and confidence charts
+- **Batched Inference** - Process all 4 cameras in a single GPU forward pass
+- **Performance Comparison** - Batch vs sequential metrics with optimization recommendations
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
 - Python 3.10+
-- Node.js 20.19+ (for web UI)
+- Node.js 20+ (for the React frontend)
 - Reolink NVR with FLV streaming enabled
 
 ### Installation
 
-1. **Clone and setup:**
 ```bash
-cd E:\home-cam
+git clone <repo-url>
+cd home-cam
+
+# Python backend
 python -m venv venv
-.\venv\Scripts\activate
+venv\Scripts\activate        # Windows
+# source venv/bin/activate   # Linux/Mac
 pip install -r requirements.txt
+
+# React frontend
+cd frontend
+npm install
+cd ..
 ```
 
-2. **Configure your NVR:**
-```bash
-# Edit .env file
+### Configuration
+
+Copy `.env.example` to `.env` and edit:
+
+```env
 REOLINK_IP=192.168.2.112
 REOLINK_USERNAME=admin
 REOLINK_PASSWORD=your_password
-YOLO_MODEL=yolo11n.pt
+YOLO_MODEL=yolo26n.pt
+YOLO_DEVICE=cpu               # or cuda for GPU
 ```
 
-3. **Initialize cameras:**
-```bash
-python setup_nvr_cameras.py
-```
-
-4. **Start the backend:**
-```bash
-python run.py
-```
-
-5. **Access the system:**
-- Web Viewer: http://localhost:8000/viewer
-- API Docs: http://localhost:8000/docs
-- Camera Streams: http://localhost:8000/cameras/nvr_ch1/stream
-
-### Optional: Start Web UI
+### Running
 
 ```bash
-cd web
-npm install
+# Terminal 1: Start backend (cameras + detection + API)
+venv\Scripts\activate
+python batched_viewer.py
+# Runs on http://localhost:5001
+
+# Terminal 2: Start frontend
+cd frontend
 npm run dev
+# Runs on http://localhost:5173 (proxies API calls to backend)
 ```
 
-Access at http://localhost:5173
+Open http://localhost:5173 in your browser.
 
-## 📹 Camera Access
+### Optional: AI Queries with Ollama
 
-Your cameras are **always available** through the NVR. No need to start/stop them!
+To use natural language database queries:
 
-**Direct streams:**
-- Channel 1: `http://localhost:8000/cameras/nvr_ch1/stream`
-- Channel 2: `http://localhost:8000/cameras/nvr_ch2/stream`
-- Channel 3: `http://localhost:8000/cameras/nvr_ch3/stream`
-- Channel 4: `http://localhost:8000/cameras/nvr_ch4/stream`
-
-## 🛠️ Utilities
-
-### Test System Health
 ```bash
-python test_system.py
+# Install Ollama from https://ollama.com
+ollama pull gemma4:e2b
+# Ollama runs automatically on localhost:11434
 ```
 
-### Check Camera Status
-```bash
-python check_camera_status.py
+## Architecture
+
+```
+Reolink NVR (4 channels via FLV)
+    |
+    v
+Frame Capture Threads (1 per camera)
+    |
+    v
+Privacy Zone Masking (black out regions before detection)
+    |
+    v
+YOLO26 Detection (batched or per-camera with tracking)
+    |--- BoT-SORT + Re-ID tracking (persist=True per camera)
+    |--- DetectionsSmoother (reduces box jitter)
+    |--- TraceAnnotator (movement trails)
+    |
+    v
+MJPEG Streams + SQLite Persistence
+    |
+    v
+Flask Backend (REST API + MJPEG)     React Frontend (Vite + Tailwind)
+    port 5001                             port 5173
 ```
 
-### View Statistics
-```bash
-python get_statistics.py
+## Project Structure
+
+```
+home-cam/
+├── batched_viewer.py            # Main backend: cameras, detection, tracking, API
+├── simple_viewer.py             # Simpler single-process viewer (no tracking)
+├── surveillance_tracker.yaml    # BoT-SORT + Re-ID tracker config
+├── requirements.txt             # Python dependencies
+├── .env                         # Configuration (not in git)
+├── .env.example                 # Configuration template
+│
+├── backend_api/                 # Flask Blueprint extensions
+│   ├── __init__.py              # Blueprint registration
+│   ├── database.py              # SQLite schema, queries, persistence
+│   ├── zones.py                 # Zone/line CRUD endpoints
+│   ├── events_api.py            # Event log, SQL query, stats endpoints
+│   ├── classes_api.py           # COCO class filter endpoints
+│   └── llm_service.py           # Ollama/Gemma 4 text-to-SQL integration
+│
+└── frontend/                    # React SPA
+    ├── package.json
+    ├── vite.config.js           # Dev server with API proxy to backend
+    ├── tailwind.config.js       # Dark neon theme config
+    └── src/
+        ├── App.jsx              # Router + layout + polling
+        ├── api/client.js        # API client for all backend calls
+        ├── stores/store.js      # Zustand state (config, zones, events)
+        ├── pages/
+        │   ├── Dashboard.jsx    # Camera grid + drawing tools + event log
+        │   ├── Analytics.jsx    # Recharts performance dashboard
+        │   ├── Database.jsx     # Browse, SQL query, AI query tabs
+        │   └── Settings.jsx     # Toggles, FPS slider, class selector, zones
+        └── components/
+            ├── camera/          # CameraCard, CameraOverlay (Konva canvas), zoom
+            ├── drawing/         # DrawingToolbar (privacy/counting/line tools)
+            ├── events/          # EventLog (real-time detection feed)
+            ├── database/        # TableViewer, QueryEditor, LLMQuery
+            ├── settings/        # ClassSelector (80 COCO classes), FPSControl
+            └── layout/          # Sidebar, Header with status pills
 ```
 
-### Test Streaming
-```bash
-python test_simple_stream.py
-```
+## API Endpoints
 
-### Complete Diagnostic
-```bash
-python test_and_start.py
-```
-
-## 📊 API Endpoints
+### Existing (batched_viewer.py)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/` | GET | Health check |
-| `/cameras` | GET | List all cameras |
-| `/cameras/{id}/stream` | GET | MJPEG stream with detection |
-| `/detections` | GET | Query detection history |
-| `/statistics` | GET | Detection statistics |
-| `/chat` | POST | AI chat about detections |
-| `/viewer` | GET | Web interface |
+| `/` | GET | Legacy 4-camera HTML view |
+| `/video_feed/<channel>` | GET | MJPEG stream (0-3) |
+| `/toggle_detection` | POST | Toggle YOLO detection on/off |
+| `/toggle_tracking` | POST | Toggle BoT-SORT + Re-ID tracking |
+| `/toggle_batched_mode` | POST | Toggle batched vs sequential inference |
+| `/toggle_auto_fps` | POST | Toggle automatic FPS detection |
+| `/set_target_fps` | POST | Set manual target FPS (1-60) |
+| `/get_config` | GET | Current configuration state |
+| `/api/metrics` | GET | Full metrics (FPS, detections, batch times) |
+| `/api/batch_stats` | GET | Quick batch statistics |
+| `/api/comparison_metrics` | GET | Batch vs sequential comparison |
+| `/analytics` | GET | Legacy analytics page |
+| `/comparison` | GET | Legacy comparison page |
 
-Full API documentation: http://localhost:8000/docs
+### New (backend_api/)
 
-## 🏗️ Architecture
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/zones` | GET/POST | List or create zones (privacy, counting, crossing line) |
+| `/api/zones/<id>` | PUT/DELETE | Update or delete a zone |
+| `/api/classes` | GET | List 80 COCO classes with enabled status |
+| `/api/classes/filter` | POST | Set which classes to detect |
+| `/api/events` | GET | Paginated detection event log |
+| `/api/events/stats` | GET | Detection statistics (per class, per camera) |
+| `/api/db/query` | POST | Execute a read-only SQL query |
+| `/api/db/llm-query` | POST | Natural language to SQL via Ollama |
+| `/api/db/schema` | GET | Database schema (for LLM context) |
 
-```
-Reolink NVR (4 channels)
-    ↓
-Token-based Authentication (reolinkapi)
-    ↓
-FastAPI Backend (Python)
-    ↓
-YOLOv11 Detection (Ultralytics)
-    ↓
-SQLite Database
-    ↓
-WebSocket + REST API
-    ↓
-Web UI (SvelteKit) or Simple Viewer
-```
+## YOLO Models
 
-## 🔧 Configuration
+The default is `yolo26n.pt` (YOLO26 nano), optimized for CPU:
 
-### Environment Variables (.env)
+| Model | mAP | CPU Speed | Parameters |
+|-------|-----|-----------|------------|
+| `yolo26n.pt` | 40.9 | 38.9ms | 2.4M |
+| `yolo26s.pt` | 47.0 | — | 9.6M |
+| `yolo26m.pt` | 51.5 | — | 21.8M |
+| `yolo26l.pt` | 53.2 | — | 44.5M |
 
-```env
-# NVR Settings
-REOLINK_IP=192.168.2.112
-REOLINK_USERNAME=admin
-REOLINK_PASSWORD=your_password
-REOLINK_RTSP_PORT=554
+Set via `YOLO_MODEL` in `.env`. Models are downloaded automatically on first run.
 
-# Detection Settings
-YOLO_MODEL=yolo11n.pt
-YOLO_CONFIDENCE=0.5
-YOLO_DEVICE=cpu
+## Tracker Configuration
 
-# API Settings
-API_HOST=0.0.0.0
-API_PORT=8000
-DEBUG=False
+The `surveillance_tracker.yaml` configures BoT-SORT for fixed surveillance cameras:
 
-# Optional: AI Chat
-HF_TOKEN=your_huggingface_token
-HF_MODEL=mistralai/Mistral-7B-Instruct-v0.1
-```
+- **with_reid: true** - Appearance-based re-identification
+- **model: auto** - Reuses YOLO backbone features (zero extra overhead)
+- **gmc_method: none** - No motion compensation (cameras are fixed)
+- **track_buffer: 90** - Keep lost tracks for ~8 seconds
 
-### YOLO Models
+## Database Schema
 
-- `yolo11n.pt` - Nano (fastest, default)
-- `yolo11s.pt` - Small
-- `yolo11m.pt` - Medium
-- `yolo11l.pt` - Large (most accurate)
-- `yolo11x.pt` - Extra Large
+Detections are persisted to `surveillance.db` (SQLite):
 
-## 📁 Project Structure
-
-```
-E:\home-cam\
-├── main.py              # FastAPI application
-├── run.py               # Startup script
-├── config.py            # Configuration
-├── database.py          # SQLAlchemy models
-├── llm_service.py       # AI chat service
-├── requirements.txt     # Python dependencies
-├── .env                 # Configuration (not in git)
-│
-├── camera/
-│   ├── __init__.py
-│   ├── detector.py      # YOLOv11 wrapper
-│   └── reolink_api.py   # NVR authentication
-│
-├── web/
-│   ├── src/             # SvelteKit UI
-│   └── static/          # Simple HTML viewer
-│
-└── utils/
-    ├── test_system.py
-    ├── check_camera_status.py
-    └── setup_nvr_cameras.py
+```sql
+detections (id, timestamp, channel, class_name, class_id, confidence, x1, y1, x2, y2, tracker_id)
+zones (id, camera, type, label, coords, classes, color, enabled, created_at)
+zone_events (id, timestamp, zone_id, event_type, class_name, tracker_id)
 ```
 
-## 🎨 Web Interface
+## Security Notes
 
-The system includes two UI options:
+- NVR credentials are stored in `.env` (gitignored)
+- SQL queries via the frontend are restricted to SELECT only
+- The LLM query endpoint validates generated SQL before execution
+- No secrets are hardcoded in source files
 
-### 1. Simple HTML Viewer (No setup required)
-- Access: `http://localhost:8000/viewer`
-- Features: 4-camera grid, statistics, neon theme
-- No dependencies: Pure HTML/CSS/JS
-
-### 2. SvelteKit UI (Advanced)
-- Access: `http://localhost:5173` (after `npm run dev`)
-- Features: Full dashboard, WebSocket updates, chat interface
-- Requires: Node.js 20.19+
-
-## 🐛 Troubleshooting
-
-### Backend won't start
-```bash
-# Check imports
-python -c "import main"
-
-# Check port
-netstat -ano | findstr :8000
-
-# View logs
-python run.py
-```
-
-### Cameras not connecting
-```bash
-# Test NVR connection
-ping 192.168.2.112
-
-# Test authentication
-python test_simple_stream.py
-
-# Check credentials in .env
-```
-
-### No detections
-```bash
-# Lower confidence threshold
-# Edit .env: YOLO_CONFIDENCE=0.3
-
-# Check YOLO model
-dir yolo11n.pt
-```
-
-## 📖 Documentation
-
-- **README.md** - This file (complete guide)
-- **QUICKSTART.md** - Step-by-step setup guide
-- **QUICK_REFERENCE.md** - Command cheat sheet
-- `.env.example` - Configuration template
-
-## 🔐 Security Notes
-
-For production deployment:
-1. Change default passwords
-2. Use PostgreSQL instead of SQLite
-3. Enable HTTPS/SSL
-4. Configure CORS properly
-5. Add authentication
-6. Use environment variables (not .env file)
-
-## 🤝 Contributing
-
-This is a personal project, but improvements are welcome!
-
-## 📄 License
+## License
 
 MIT License - See LICENSE file
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
-- **Ultralytics** - YOLOv11 object detection
-- **FastAPI** - Modern Python web framework
-- **SvelteKit** - Reactive web UI framework
-- **reolinkapi** - Reolink camera integration
-- **LangChain** - AI chat functionality
+- [Ultralytics](https://ultralytics.com) - YOLO26 object detection
+- [Supervision](https://supervision.roboflow.com) - Annotation, tracking utilities, smoothing
+- [Ollama](https://ollama.com) - Local LLM runtime
+- [reolinkapi](https://github.com/ReolinkCameraAPI/reolinkapipy) - NVR integration
 
-## 📞 Support
-
-For issues:
-1. Run `python test_and_start.py` for diagnostics
-2. Check logs in terminal
-3. Review API docs at `/docs`
-4. Test individual components with utility scripts
-
----
-
-**Built with:** FastAPI • SvelteKit • YOLOv11 • LangChain • SQLAlchemy
-
-**Status:** ✅ Production Ready
-
-**Last Updated:** November 1, 2025
-
+**Built with:** Flask, React, Vite, Tailwind CSS, YOLO26, BoT-SORT, Recharts, Konva, Zustand, SQLite, Ollama

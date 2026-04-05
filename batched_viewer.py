@@ -4,6 +4,7 @@ Processes all 4 camera frames in a single batch for better GPU utilization
 Includes comprehensive performance metrics and comparison data
 """
 from flask import Flask, Response, request, jsonify
+from flask_cors import CORS
 from reolinkapi import Camera
 import cv2
 import threading
@@ -20,6 +21,15 @@ from collections import deque
 load_dotenv()
 
 app = Flask(__name__)
+CORS(app)
+
+# Register backend API extensions (database, zones, events, classes, LLM)
+try:
+    from backend_api import register_blueprints
+    register_blueprints(app)
+    print("[OK] Backend API extensions registered (database, zones, events, classes, LLM)")
+except Exception as e:
+    print(f"[WARN] Could not load backend_api extensions: {e}")
 
 # NVR Configuration from environment variables
 NVR_IP = os.getenv('REOLINK_IP', '192.168.2.112')
@@ -61,7 +71,7 @@ performance_metrics = {
 metrics_lock = threading.Lock()
 
 # Initialize YOLO model with configuration from environment
-YOLO_MODEL = os.getenv('YOLO_MODEL', 'yolo11n.pt')
+YOLO_MODEL = os.getenv('YOLO_MODEL', 'yolo26n.pt')
 YOLO_DEVICE = os.getenv('YOLO_DEVICE', 'cpu')
 BATCH_SIZE = 4  # Number of cameras we process in batch
 
@@ -99,26 +109,28 @@ try:
 except Exception as e:
     print(f"[ERROR] Failed to load model: {e}")
     # Fallback to nano model on CPU
-    model = YOLO("yolo11n.pt")
-    print("[OK] Fallback: yolo11n.pt loaded on CPU")
+    model = YOLO("yolo26n.pt")
+    print("[OK] Fallback: yolo26n.pt loaded on CPU")
     USE_GPU = False
 
 # Initialize supervision annotators
 box_annotator = sv.BoxAnnotator(thickness=2)
 label_annotator = sv.LabelAnnotator(text_thickness=1, text_scale=0.5)
+trace_annotators = {ch: sv.TraceAnnotator(thickness=2, trace_length=60) for ch in range(4)}
+smoothers = {ch: sv.DetectionsSmoother(length=5) for ch in range(4)}
 
-# Initialize ByteTrack trackers for each camera (separate tracker per camera for independent tracking)
-print("\n[INFO] Initializing ByteTrack trackers with re-identification...")
-trackers = {}
+# Tracker config path for BoT-SORT + Re-ID
+TRACKER_CONFIG = os.path.join(os.path.dirname(__file__), 'surveillance_tracker.yaml')
+
+# Per-camera model instances for model.track(persist=True)
+# Each camera needs its own model instance to maintain independent tracking state
+print("\n[INFO] Initializing BoT-SORT trackers with Re-ID per camera...")
+tracker_models = {}
 for channel in range(4):
-    trackers[channel] = sv.ByteTrack(
-        track_activation_threshold=0.5,  # Minimum confidence to start tracking
-        lost_track_buffer=30,  # Frames to keep lost tracks in memory
-        minimum_matching_threshold=0.8,  # IoU threshold for matching
-        frame_rate=30,  # Assumed frame rate
-        minimum_consecutive_frames=3  # Minimum frames to confirm a track
-    )
-print("[OK] ByteTrack trackers initialized for all channels")
+    tracker_models[channel] = YOLO(YOLO_MODEL)
+    if USE_GPU:
+        tracker_models[channel].to('cuda')
+print(f"[OK] BoT-SORT + Re-ID trackers initialized for all channels (config: {TRACKER_CONFIG})")
 
 # Get token once for all channels
 print(f"\nConnecting to NVR at {NVR_IP}...")
@@ -200,6 +212,34 @@ def frame_capture_thread(channel):
         time.sleep(0.01)  # Small delay to prevent CPU overload
 
 
+def _get_privacy_zones():
+    """Load privacy zones from database, grouped by camera. Cached briefly."""
+    if not hasattr(_get_privacy_zones, '_cache_time'):
+        _get_privacy_zones._cache_time = 0
+        _get_privacy_zones._cache = {}
+    # Refresh every 2 seconds
+    now = time.time()
+    if now - _get_privacy_zones._cache_time < 2:
+        return _get_privacy_zones._cache
+    try:
+        import json as _json
+        from backend_api.database import get_db
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT camera, coords FROM zones WHERE type='privacy' AND enabled=1"
+        ).fetchall()
+        result = {}
+        for row in rows:
+            cam = row['camera']
+            coords = _json.loads(row['coords'])
+            result.setdefault(cam, []).append(coords)
+        _get_privacy_zones._cache = result
+        _get_privacy_zones._cache_time = now
+        return result
+    except Exception:
+        return _get_privacy_zones._cache
+
+
 def batch_detection_thread():
     """Process all 4 camera frames in a single batch or sequentially based on BATCHED_MODE"""
     global DETECTION_ENABLED, BATCHED_MODE, AUTO_FPS, TARGET_FPS
@@ -252,11 +292,33 @@ def batch_detection_thread():
 
         preprocess_time = (time.time() - preprocess_start) * 1000  # ms
 
+        # Apply privacy zone masks before detection
+        # This blacks out regions so YOLO never sees them
+        privacy_zones = _get_privacy_zones()
+        for idx, channel in enumerate(channels_in_batch):
+            zones_for_cam = privacy_zones.get(channel, [])
+            if zones_for_cam:
+                h, w = frames_batch[idx].shape[:2]
+                for coords in zones_for_cam:
+                    tl, br = coords
+                    x1, y1 = int(tl['x'] * w), int(tl['y'] * h)
+                    x2, y2 = int(br['x'] * w), int(br['y'] * h)
+                    frames_batch[idx][y1:y2, x1:x2] = 0  # Black out
+
         # Run inference (batched or sequential based on mode)
         try:
             inference_start = time.time()
 
-            if current_batched_mode:
+            if TRACKING_ENABLED:
+                # TRACKING MODE: Use per-camera model.track() with BoT-SORT + Re-ID
+                # Cannot batch when tracking because each camera needs persistent state
+                results_batch = []
+                for frame, channel in zip(frames_batch, channels_in_batch):
+                    result = tracker_models[channel].track(
+                        frame, persist=True, tracker=TRACKER_CONFIG, verbose=False
+                    )
+                    results_batch.append(result[0] if isinstance(result, list) else result)
+            elif current_batched_mode:
                 # BATCHED MODE: Process all frames in a single forward pass
                 results_batch = model(frames_batch, verbose=False)
             else:
@@ -278,9 +340,9 @@ def batch_detection_thread():
                 detections = sv.Detections.from_ultralytics(result)
                 detections = detections[detections.confidence > 0.5]
 
-                # Apply tracking if enabled
-                if TRACKING_ENABLED:
-                    detections = trackers[channel].update_with_detections(detections)
+                # Smooth bounding boxes to reduce jitter (requires tracker_id)
+                if TRACKING_ENABLED and detections.tracker_id is not None:
+                    detections = smoothers[channel].update_with_detections(detections)
 
                 # Track metrics
                 with metrics_lock:
@@ -289,15 +351,30 @@ def batch_detection_thread():
                         performance_metrics['start_time'] = current_time
 
                     # Record detections
-                    for class_id, confidence in zip(detections.class_id, detections.confidence):
+                    db_batch = []
+                    for det_idx, (class_id, confidence) in enumerate(zip(detections.class_id, detections.confidence)):
+                        class_name = result.names[class_id]
                         performance_metrics['detections'].append({
                             'timestamp': current_time,
                             'channel': channel,
-                            'class': result.names[class_id],
+                            'class': class_name,
                             'confidence': float(confidence)
                         })
                         performance_metrics['confidence'].append(float(confidence))
                         performance_metrics['total_detections'] += 1
+
+                        # Prepare DB record
+                        bbox = detections.xyxy[det_idx] if det_idx < len(detections.xyxy) else [None]*4
+                        tracker_id = int(detections.tracker_id[det_idx]) if (TRACKING_ENABLED and detections.tracker_id is not None and det_idx < len(detections.tracker_id)) else None
+                        db_batch.append((
+                            current_time, channel, class_name, int(class_id),
+                            float(confidence),
+                            float(bbox[0]) if bbox[0] is not None else None,
+                            float(bbox[1]) if bbox[1] is not None else None,
+                            float(bbox[2]) if bbox[2] is not None else None,
+                            float(bbox[3]) if bbox[3] is not None else None,
+                            tracker_id
+                        ))
 
                     # Keep only last 1000 detections
                     if len(performance_metrics['detections']) > 1000:
@@ -307,8 +384,20 @@ def batch_detection_thread():
 
                     performance_metrics['frames_processed'][channel] += 1
 
+                # Persist detections to database (outside metrics lock)
+                if db_batch:
+                    try:
+                        from backend_api.database import insert_detections_batch
+                        insert_detections_batch(db_batch)
+                    except Exception:
+                        pass  # DB not available
+
                 # Annotate frame
                 annotated = box_annotator.annotate(scene=frame, detections=detections)
+
+                # Draw movement trails when tracking is enabled
+                if TRACKING_ENABLED and detections.tracker_id is not None:
+                    annotated = trace_annotators[channel].annotate(scene=annotated, detections=detections)
 
                 # Create labels with tracker IDs if tracking is enabled
                 if TRACKING_ENABLED and detections.tracker_id is not None:
@@ -963,14 +1052,16 @@ def toggle_tracking():
     with config_lock:
         TRACKING_ENABLED = not TRACKING_ENABLED
 
-    # Reset all trackers when toggling
+    # Reset tracker models when toggling to clear persisted state
     if TRACKING_ENABLED:
-        print("\n[INFO] Object tracking enabled - ByteTrack with re-ID active")
+        print("\n[INFO] Object tracking enabled - BoT-SORT with Re-ID active")
     else:
         print("\n[INFO] Object tracking disabled")
-        # Reset trackers to clear old IDs
-        for channel in trackers:
-            trackers[channel].reset()
+        # Reload tracker models to clear persisted tracking state
+        for channel in tracker_models:
+            tracker_models[channel] = YOLO(YOLO_MODEL)
+            if USE_GPU:
+                tracker_models[channel].to('cuda')
 
     return jsonify({
         'tracking_enabled': TRACKING_ENABLED,
@@ -1023,7 +1114,8 @@ def get_config():
             'detection_enabled': DETECTION_ENABLED,
             'batched_mode': BATCHED_MODE,
             'auto_fps': AUTO_FPS,
-            'target_fps': TARGET_FPS
+            'target_fps': TARGET_FPS,
+            'tracking_enabled': TRACKING_ENABLED
         })
 
 

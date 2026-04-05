@@ -1,0 +1,69 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --neon-green: #00ff88;
+  --neon-cyan: #00ccff;
+  --neon-magenta: #ff00ff;
+  --surface: #12121a;
+  --surface-dark: #0a0a0f;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background-color: #0a0a0f;
+  color: #e0e0e0;
+  font-family: 'Inter', system-ui, sans-serif;
+  overflow: hidden;
+  height: 100vh;
+}
+
+#root {
+  height: 100vh;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0a0a0f;
+}
+::-webkit-scrollbar-thumb {
+  background: #2e2e4e;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3e3e5e;
+}
+
+/* Neon glow utility classes */
+@layer utilities {
+  .glow-green {
+    box-shadow: 0 0 20px rgba(0, 255, 136, 0.3);
+  }
+  .glow-cyan {
+    box-shadow: 0 0 20px rgba(0, 204, 255, 0.3);
+  }
+  .glow-magenta {
+    box-shadow: 0 0 20px rgba(255, 0, 255, 0.3);
+  }
+  .text-glow-green {
+    text-shadow: 0 0 10px rgba(0, 255, 136, 0.5);
+  }
+  .text-glow-cyan {
+    text-shadow: 0 0 10px rgba(0, 204, 255, 0.5);
+  }
+  .glass {
+    background: rgba(18, 18, 26, 0.8);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+  }
+}

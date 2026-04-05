@@ -43,7 +43,7 @@ performance_metrics = {
 metrics_lock = threading.Lock()
 
 # Initialize YOLO model with configuration from environment
-YOLO_MODEL = os.getenv('YOLO_MODEL', 'yolo11n.pt')
+YOLO_MODEL = os.getenv('YOLO_MODEL', 'yolo26n.pt')
 YOLO_DEVICE = os.getenv('YOLO_DEVICE', 'cpu')
 
 print(f"\n[INFO] Loading {YOLO_MODEL} on {YOLO_DEVICE.upper()}...")
