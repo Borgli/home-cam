@@ -6,11 +6,15 @@ Includes comprehensive performance metrics and comparison data
 from flask import Flask, Response, request, jsonify
 from flask_cors import CORS
 from reolinkapi import Camera
+import atexit
 import cv2
+import math
+import sys
 import threading
 import time
 import os
 from dotenv import load_dotenv
+import requests
 import supervision as sv
 import numpy as np
 import torch
@@ -20,6 +24,8 @@ from collections import deque
 load_dotenv()
 
 from inference_backend import select_backend, cpu_backend
+from reolink_native import (HDStreamManager, NvrSnapshotClient, HDLimitReached, HDUnavailable,
+                            ReolinkError, frame_to_bgr)
 
 app = Flask(__name__)
 CORS(app)
@@ -155,6 +161,21 @@ for channel in range(4):
 
 print(f"\n[OK] {len(cameras)} cameras ready")
 
+# 4K main streams, started on demand from the dashboard. The NVR only relays the
+# cameras' H.265 4K streams over Reolink's native protocol (port 9000) and serves
+# at most two at once; see reolink_native.py.
+hd_streams = HDStreamManager(
+    NVR_IP, USERNAME, PASSWORD,
+    port=int(os.getenv('REOLINK_MEDIA_PORT', '9000')),
+    max_streams=int(os.getenv('REOLINK_HD_MAX_STREAMS', '2')),
+    idle_seconds=float(os.getenv('REOLINK_HD_IDLE_SECONDS', '20')),
+    decoder=os.getenv('REOLINK_HD_DECODER', 'auto'),
+)
+nvr_snapshots = NvrSnapshotClient(NVR_IP, USERNAME, PASSWORD)  # 4K stills over HTTP when no stream runs
+atexit.register(nvr_snapshots.close)
+atexit.register(hd_streams.shutdown)
+print(f"[OK] 4K on demand: up to {hd_streams.max_streams} cameras at once (decoder: {hd_streams.decoder})")
+
 # Shared frame buffers for batch processing
 latest_frames = {i: None for i in range(4)}
 frames_lock = threading.Lock()
@@ -162,6 +183,11 @@ frames_lock = threading.Lock()
 # Annotated frames ready for streaming
 annotated_frames = {i: None for i in range(4)}
 annotated_lock = threading.Lock()
+
+# Latest detections per camera, in detection-frame pixels: (time, frame width,
+# frame height, xyxy boxes, labels). Drawn onto the 4K view.
+hd_overlay = {i: None for i in range(4)}
+hd_overlay_lock = threading.Lock()
 
 # Frame queues for synchronization
 frame_queues = {i: deque(maxlen=10) for i in range(4)}
@@ -410,6 +436,9 @@ def batch_detection_thread():
                         f"{result.names[class_id]} {confidence:.2f}"
                         for class_id, confidence in zip(detections.class_id, detections.confidence)
                     ]
+                with hd_overlay_lock:
+                    hd_overlay[channel] = (time.time(), frame.shape[1], frame.shape[0],
+                                           detections.xyxy.copy(), list(labels))
                 annotated = label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
 
                 # Add processing mode info overlay
@@ -1115,8 +1144,183 @@ def get_config():
             'tracking_enabled': TRACKING_ENABLED,
             'inference_backend': BACKEND.to_dict(),
             'model': YOLO_MODEL,
-            'tracker': TRACKER_INFO
+            'tracker': TRACKER_INFO,
+            'hd': hd_streams.status(),
         })
+
+
+# --- 4K view ------------------------------------------------------------------
+# The dashboard turns 4K on per camera (POST), then polls /frame with the region
+# it shows; the backend crops that region out of the 4K frame before scaling, so
+# zooming in shows real detail instead of an upscaled 720p image.
+
+HD_BOX_COLOR = (136, 255, 0)  # neon green #00ff88, BGR
+
+
+def _hd_error(message, status, **extra):
+    return jsonify({'error': message, **extra}), status
+
+
+def _mask_privacy(img, channel, region):
+    """Black out the camera's privacy zones in an image that shows `region` (x0, y0, x1, y1, 0-1) of the frame."""
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = region
+    sx, sy = w / (x1 - x0), h / (y1 - y0)
+    for coords in _get_privacy_zones().get(channel, []):
+        try:
+            tl, br = coords
+            zx0, zx1 = sorted((float(tl['x']), float(br['x'])))
+            zy0, zy1 = sorted((float(tl['y']), float(br['y'])))
+        except (TypeError, ValueError, KeyError):
+            continue
+        # One extra pixel on each side covers scaling blur at the zone's edge
+        px0, px1 = max(0, math.floor((zx0 - x0) * sx) - 1), min(w, math.ceil((zx1 - x0) * sx) + 1)
+        py0, py1 = max(0, math.floor((zy0 - y0) * sy) - 1), min(h, math.ceil((zy1 - y0) * sy) + 1)
+        if px1 > px0 and py1 > py0:
+            img[py0:py1, px0:px1] = 0
+
+
+def _draw_hd_detections(img, channel, region):
+    """Draw the camera's latest detections (from the 720p detection frames) onto a 4K view."""
+    if not DETECTION_ENABLED:
+        return
+    with hd_overlay_lock:
+        entry = hd_overlay.get(channel)
+    if not entry or time.time() - entry[0] > 2.0:
+        return
+    _, fw, fh, boxes, labels = entry
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = region
+    sx, sy = w / ((x1 - x0) * fw), h / ((y1 - y0) * fh)
+    for (bx0, by0, bx1, by1), label in zip(boxes, labels):
+        p0 = (int((bx0 - x0 * fw) * sx), int((by0 - y0 * fh) * sy))
+        p1 = (int((bx1 - x0 * fw) * sx), int((by1 - y0 * fh) * sy))
+        if p1[0] < 0 or p1[1] < 0 or p0[0] > w or p0[1] > h:
+            continue
+        cv2.rectangle(img, p0, p1, HD_BOX_COLOR, 2)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        tx, ty = max(0, p0[0]), max(th + 6, p0[1])
+        cv2.rectangle(img, (tx, ty - th - 6), (tx + tw + 6, ty), HD_BOX_COLOR, -1)
+        cv2.putText(img, label, (tx + 3, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (15, 10, 10), 1, cv2.LINE_AA)
+
+
+def _render_hd_view(channel, frame, region, out_w):
+    """The part of a 4K frame given by `region` (0-1 coordinates, may extend past the edges), out_w pixels wide."""
+    x0, y0, x1, y1 = region
+    W, H = frame.width, frame.height
+    rx0, ry0, rx1, ry1 = x0 * W, y0 * H, x1 * W, y1 * H
+    out_h = max(2, round(out_w * (ry1 - ry0) / (rx1 - rx0)))
+    canvas = np.zeros((out_h, out_w, 3), np.uint8)
+    sx, sy = out_w / (rx1 - rx0), out_h / (ry1 - ry0)
+    # Part of the region inside the frame, widened to even pixels for the 4:2:0 chroma planes
+    ax0, ay0 = max(0, math.floor(rx0)) & ~1, max(0, math.floor(ry0)) & ~1
+    ax1, ay1 = min(W, (math.ceil(rx1) + 1) & ~1), min(H, (math.ceil(ry1) + 1) & ~1)
+    if ax1 - ax0 >= 2 and ay1 - ay0 >= 2:
+        dx0, dy0 = round((ax0 - rx0) * sx), round((ay0 - ry0) * sy)
+        dx1, dy1 = round((ax1 - rx0) * sx), round((ay1 - ry0) * sy)
+        if dx1 > dx0 and dy1 > dy0:
+            part = frame_to_bgr(frame, (ax0, ay0, ax1 - ax0, ay1 - ay0), (dx1 - dx0, dy1 - dy0))
+            cx0, cy0, cx1, cy1 = max(0, dx0), max(0, dy0), min(out_w, dx1), min(out_h, dy1)
+            if cx1 > cx0 and cy1 > cy0:
+                canvas[cy0:cy1, cx0:cx1] = part[cy0 - dy0:cy1 - dy0, cx0 - dx0:cx1 - dx0]
+    _mask_privacy(canvas, channel, region)
+    return canvas
+
+
+@app.route('/api/hd/status')
+def hd_status():
+    """Running 4K streams and the limit."""
+    return jsonify(hd_streams.status())
+
+
+@app.route('/api/hd/<int:channel>', methods=['POST'])
+def hd_start(channel):
+    """Start the camera's 4K stream (waits for the first frame). 409 when the NVR's limit is reached."""
+    if channel not in cameras:
+        return _hd_error('Unknown camera', 404)
+    try:
+        info = hd_streams.acquire(channel)
+    except HDLimitReached as e:
+        return _hd_error(str(e), 409, active=e.active)
+    except HDUnavailable as e:
+        return _hd_error(str(e), 502)
+    return jsonify(info)
+
+
+@app.route('/api/hd/<int:channel>', methods=['DELETE'])
+def hd_stop(channel):
+    """Stop the camera's 4K stream so another camera can use the NVR's slot."""
+    return jsonify({'stopped': hd_streams.release(channel)})
+
+
+@app.route('/api/hd/<int:channel>/frame')
+def hd_frame(channel):
+    """JPEG of the region x0,y0,x1,y1 (0-1) of the newest 4K frame, w pixels wide, with detections and privacy masks."""
+    stream = hd_streams.get(channel)  # also keeps the stream from being stopped as idle
+    if stream is None:
+        return _hd_error('4K is not on for this camera', 404)
+    _, frame, frame_time = stream.latest()
+    if frame is None or time.time() - frame_time > 5:
+        info = stream.info()
+        return _hd_error(info['error'] or f"4K stream {info['status']}", 503, stream=info)
+    try:
+        region = tuple(float(request.args.get(k, d)) for k, d in (('x0', 0), ('y0', 0), ('x1', 1), ('y1', 1)))
+        out_w = max(64, min(2560, int(request.args.get('w', 1280))))
+    except ValueError:
+        return _hd_error('Bad view parameters', 400)
+    x0, y0, x1, y1 = region
+    if not all(math.isfinite(v) for v in region) or not (1 / 32 <= x1 - x0 <= 4 and 1 / 32 <= y1 - y0 <= 4):
+        return _hd_error('Bad view parameters', 400)
+    t0 = time.perf_counter()
+    img = _render_hd_view(channel, frame, region, out_w)
+    if request.args.get('overlay', '1') != '0':
+        _draw_hd_detections(img, channel, region)
+    t1 = time.perf_counter()
+    ok, jpg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    if not ok:
+        return _hd_error('JPEG encoding failed', 500)
+    t2 = time.perf_counter()
+    resp = Response(jpg.tobytes(), mimetype='image/jpeg')
+    resp.headers['Cache-Control'] = 'no-store'
+    resp.headers['X-Frame-Age-Ms'] = str(int((time.time() - frame_time) * 1000))
+    resp.headers['Server-Timing'] = f'render;dur={1000 * (t1 - t0):.1f}, jpeg;dur={1000 * (t2 - t1):.1f}'
+    return resp
+
+
+@app.route('/api/hd/<int:channel>/snapshot')
+def hd_snapshot(channel):
+    """Full-resolution still: from the running 4K stream, else from the NVR (HTTP Snap, about 1.6 s)."""
+    if channel not in cameras:
+        return _hd_error('Unknown camera', 404)
+    frame = None
+    stream = hd_streams.get(channel, touch=False)
+    if stream:
+        _, frame, frame_time = stream.latest()
+        if frame is not None and time.time() - frame_time > 5:
+            frame = None
+    jpg, img = None, None
+    if frame is not None:
+        source, img = 'stream', frame_to_bgr(frame)
+    else:
+        try:
+            jpg = nvr_snapshots.snapshot(channel)
+        except (ReolinkError, requests.RequestException, ValueError) as e:
+            return _hd_error(f'Snapshot failed: {e}', 502)
+        source = 'nvr'
+        if _get_privacy_zones().get(channel):
+            img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+    if img is not None:
+        _mask_privacy(img, channel, (0.0, 0.0, 1.0, 1.0))
+        ok, enc = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        if not ok:
+            return _hd_error('JPEG encoding failed', 500)
+        jpg = enc.tobytes()
+    name = f"camera{channel + 1}_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+    resp = Response(jpg, mimetype='image/jpeg')
+    resp.headers['Content-Disposition'] = f'inline; filename="{name}"'
+    resp.headers['Cache-Control'] = 'no-store'
+    resp.headers['X-Snapshot-Source'] = source
+    return resp
 
 
 @app.route('/api/batch_stats')
@@ -1866,6 +2070,11 @@ def api_metrics():
 
 
 if __name__ == '__main__':
+    # Port: --port N, else BACKEND_PORT in .env, else 5001 (the port the frontend proxies to by default)
+    port = int(os.getenv('BACKEND_PORT', '5001'))
+    if '--port' in sys.argv:
+        port = int(sys.argv[sys.argv.index('--port') + 1])
+
     print("\n" + "="*60)
     print("Starting 4-camera grid viewer with BATCHED YOLO detection...")
     print(f"Configuration from .env:")
@@ -1873,7 +2082,7 @@ if __name__ == '__main__':
     print(f"  YOLO Model: {YOLO_MODEL}")
     print(f"  Inference: {BACKEND.label}")
     print(f"  Batch Processing: ENABLED")
-    print("Open browser: http://localhost:5001")
+    print(f"Open browser: http://localhost:{port}")
     print("="*60 + "\n")
 
     # Initialize performance metrics start time
@@ -1898,6 +2107,6 @@ if __name__ == '__main__':
     # Run with increased thread support for multi-user
     # threaded=True allows multiple requests to be handled concurrently
     # processes=1 keeps it single-process (multiple threads, not processes)
-    app.run(host='0.0.0.0', port=5001, debug=False, threaded=True, processes=1)
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True, processes=1)
 
 

@@ -14,6 +14,7 @@ home-cam/
 │                                # YOLO detection, tracking, metrics, MJPEG serving
 ├── inference_backend.py         # Picks CUDA / OpenVINO / PyTorch-CPU per PC (benchmark + cache)
 ├── openvino_reid.py             # Runs the tracker's Re-ID encoder on OpenVINO where that is faster
+├── reolink_native.py            # 4K main streams over Reolink's native protocol (port 9000), on demand
 ├── simple_viewer.py             # Simpler alternative (sequential detection, no tracking)
 ├── surveillance_tracker.yaml    # Default tracker config: TrackTrack + Re-ID, fixed cameras
 ├── botsort_tracker.yaml         # Alternative: BoT-SORT + Re-ID (TRACKER_CONFIG in .env)
@@ -32,9 +33,9 @@ home-cam/
 │
 ├── frontend/                    # React 18 + Vite + Tailwind CSS SPA
 │   ├── package.json             # npm deps: react, zustand, recharts, konva, lucide
-│   ├── vite.config.js           # Dev server on :5173, proxies /api/* and /video_feed/* to :5001
+│   ├── vite.config.js           # Dev server on :5173, proxies /api/* and /video_feed/* to :5001 (BACKEND_URL)
 │   ├── tailwind.config.js       # Dark neon theme (greens, cyans, magentas)
-│   ├── start.cjs                # Node launcher that sets CWD before running Vite
+│   ├── start.cjs                # Node launcher: sets CWD, passes args to Vite, --backend <url> = proxy target
 │   └── src/
 │       ├── App.jsx              # React Router + layout + 2s polling for config/metrics
 │       ├── api/client.js        # Fetch wrapper for all backend endpoints
@@ -45,7 +46,7 @@ home-cam/
 │       │   ├── Database.jsx     # Browse detections, SQL editor, AI query (3 tabs)
 │       │   └── Settings.jsx     # Toggle cards, FPS slider, 80-class selector, zone list
 │       ├── components/
-│       │   ├── camera/CameraCard.jsx      # Single camera with zoom (wheel + buttons)
+│       │   ├── camera/CameraCard.jsx      # Single camera with zoom (wheel + buttons), 4K view, 4K still
 │       │   ├── camera/CameraOverlay.jsx   # Konva canvas for drawing zones/lines
 │       │   ├── drawing/DrawingToolbar.jsx # Tool selector: pointer/privacy/counting/line
 │       │   ├── events/EventLog.jsx        # Collapsible bottom panel, real-time detections
@@ -74,6 +75,7 @@ home-cam/
 7. **Streaming**: Annotated frames are JPEG-encoded and served as MJPEG multipart streams
 8. **Persistence**: Every detection is inserted into SQLite (timestamp, channel, class, confidence, bbox, tracker_id)
 9. **Frontend**: React app polls `/api/metrics` and `/get_config` every 2 seconds, displays MJPEG via `<img>` tags
+10. **4K view** (on demand): the dashboard can switch a camera to its 3840x2160 main stream; see [4K Streams](#4k-streams)
 
 ### Threading Model (batched_viewer.py)
 
@@ -81,7 +83,8 @@ home-cam/
 - **4 frame capture threads**: One per camera, continuously read from NVR
 - **1 batch detection thread**: Collects frames, runs YOLO, annotates, stores results
 - **N stream generator threads**: One per connected browser per camera (MJPEG)
-- Thread safety via locks: `frames_lock`, `annotated_lock`, `detection_lock`, `config_lock`, `metrics_lock`
+- **Up to 2 4K stream threads** (`reolink_native.NativeStream`): started from the dashboard, each reads and decodes one camera's 4K stream; a reaper thread stops streams nobody has requested for `REOLINK_HD_IDLE_SECONDS`
+- Thread safety via locks: `frames_lock`, `annotated_lock`, `detection_lock`, `config_lock`, `metrics_lock`, `hd_overlay_lock`
 
 ### Key Global State
 
@@ -142,6 +145,8 @@ npm run dev
 
 The frontend proxies all API calls to localhost:5001 via Vite's proxy config.
 
+To run a second copy next to a running one (e.g. to test a change without stopping it): `python batched_viewer.py --port 5002` and `node frontend/start.cjs --port 5174 --strictPort --backend http://localhost:5002`, then open http://localhost:5174. Both copies share the NVR's limit of two 4K streams.
+
 ### Environment Variables
 
 All config is in `.env`. Key settings:
@@ -156,6 +161,11 @@ All config is in `.env`. Key settings:
 | `YOLO_REBENCHMARK` | `0` | `1` re-exports the OpenVINO models and re-runs the backend benchmark on the next start |
 | `TRACKER_CONFIG` | `surveillance_tracker.yaml` | Tracker config file (`botsort_tracker.yaml` for BoT-SORT) |
 | `YOLO_CONFIDENCE` | `0.5` | Minimum detection confidence |
+| `REOLINK_MEDIA_PORT` | `9000` | NVR port for Reolink's native protocol (4K view) |
+| `REOLINK_HD_MAX_STREAMS` | `2` | Cameras that may stream 4K at once; the RLN8-410-E refuses a third |
+| `REOLINK_HD_IDLE_SECONDS` | `20` | Stop a camera's 4K stream after this long without requests |
+| `REOLINK_HD_DECODER` | `auto` | 4K decoder: `auto` (GPU if available), `software`, or an FFmpeg device (`d3d11va`, `cuda`, `vaapi`, `qsv`) |
+| `BACKEND_PORT` | `5001` | Backend port (`--port N` overrides) |
 
 **Do not commit `.env`** - it contains NVR credentials. It is gitignored.
 
@@ -232,6 +242,35 @@ If the hook point is missing, the config sets an explicit `model:`, or anything 
 
 Ultralytics also ships dedicated Re-ID models `yolo26{n,s,m,l,x}-reid.onnx` (448 px), not used here. Setting one as `model:` bypasses the OpenVINO encoder and runs it through Ultralytics directly.
 
+## 4K Streams
+
+The cameras' main streams are 3840x2160 **H.265** (configured 20 fps / 8 Mbit/s; about 12 fps and 5-6 Mbit/s at night). Detection keeps using the NVR's 1280x720 H.264 `ext` FLV stream. The 4K stream feeds the dashboard's 4K view and full-resolution stills.
+
+**Why a native-protocol client.** The NVR (RLN8-410-E, hardware H3MB16, firmware v2.0.0.280, the last release for that hardware) can't relay H.265 over its standard protocols (tested Nov 2026):
+- FLV/RTMP `channelN_main`: the FLV header announces HEVC (codec id 12), then no video arrives.
+- RTSP `h264Preview_0N_main` (what ONVIF advertises, labelled H264): the NVR never answers DESCRIBE. `h265Preview_0N_main` and `Preview_0N_main` return 404. There is no ONVIF Profile T.
+- Reolink's native "Baichuan" protocol on the media port (9000), which Reolink's own apps use, does deliver it. `reolink_native.py` implements the minimum: legacy login (for the nonce and encryption choice), the XOR-encoded modern login, AES-128-CFB afterwards (`cryptography` if installed, else OpenSSL's libcrypto through ctypes; Python ships it on Windows), `Preview` (message 3) and the BcMedia packet format. The details follow the open-source neolink and reolink_aio projects.
+
+**Limit: two 4K streams at once.** The NVR answers a third concurrent preview with code 400 (measured while the app also pulled its four 720p streams). `HDStreamManager` enforces `REOLINK_HD_MAX_STREAMS`, starts streams on demand and stops one after `REOLINK_HD_IDLE_SECONDS` without requests. Another client watching in 4K (e.g. the Reolink app in "Clear" mode) takes a slot too; the stream then reports `refused` and retries.
+
+**Decoding cost.** PyAV decodes H.265 on the GPU (`REOLINK_HD_DECODER=auto`: D3D11VA on Windows, CUDA/VAAPI on Linux) and falls back to software. On the i7-1265U / Iris Xe laptop that is ~6.6 ms of CPU per 4K frame with D3D11VA vs ~24 ms in software. Converting a whole 4K frame to BGR costs ~40 ms, so `frame_to_bgr()` crops in YUV first, then scales and converts with OpenCV (BT.709/BT.601, full or limited range from the frame's tags): a 2x-zoomed 1280x720 view costs ~9 ms and the unzoomed view ~16 ms on one core.
+
+**Endpoints** (under `/api`, so the Vite proxy forwards them):
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/hd/<ch>` | POST | Start (or keep) the camera's 4K stream and wait for its first frame. 409 = limit reached, 502 = NVR refused or unreachable |
+| `/api/hd/<ch>` | DELETE | Stop it, freeing the NVR slot |
+| `/api/hd/<ch>/frame?x0=&y0=&x1=&y1=&w=` | GET | JPEG of the region x0..x1, y0..y1 (0-1, may extend past the edges) of the newest 4K frame, `w` px wide, with the 720p detector's boxes drawn (`overlay=0` to skip) and privacy zones blacked out. 404 = not started, 503 = reconnecting |
+| `/api/hd/<ch>/snapshot` | GET | Full-resolution JPEG from the running 4K stream, else the NVR's HTTP `cmd=Snap` (~1.6 s); privacy zones blacked out |
+| `/api/hd/status` | GET | Running streams (status, fps, bitrate, decoder) and the limit; also in `GET /get_config` as `hd` |
+
+**Dashboard.** Each camera card has a **4K** toggle and a still button. With 4K on, the card polls `/frame` for the region it shows (at most ~12 times a second), so zooming in shows real 4K detail; the 720p stream stays underneath while a new region loads. The toggle lives in the store, so it survives expand/collapse, and if the backend stopped an idle stream the card starts it again once.
+
+**Privacy.** 4K frames and stills always have the privacy zones blacked out, even with detection off (the 720p stream only masks them while detection runs).
+
+**Debugging.** `venv\Scripts\python reolink_native.py <channel> [seconds]` streams one camera, prints its status every 2 s and saves a 4K still. A 4-minute run showed no drops without keepalive messages.
+
 ## Database
 
 SQLite at `surveillance.db` (auto-created). Three tables:
@@ -260,3 +299,5 @@ SQL queries from the frontend are restricted to SELECT only for safety.
 - **Tracking is slow on CPU**: Tracking uses per-camera inference (not batched). Keep `YOLO_DEVICE=auto` so a CUDA or Intel GPU is used when available
 - **Backend choice looks wrong after a driver or hardware change**: set `YOLO_REBENCHMARK=1` (or delete `model_cache/backend_choice.json`) and restart
 - **Privacy zones not blocking detections**: Backend must be restarted after the `backend_api` code was added. Zones are loaded from SQLite every 2 seconds
+- **"At most 2 cameras can stream 4K at once"**: the NVR's limit. Turn 4K off on another camera; a backend copy on another port or the Reolink app in "Clear" mode also uses slots
+- **4K says "refused" or "login failed"**: check that the NVR's media port (`REOLINK_MEDIA_PORT`, 9000) is reachable and the `.env` credentials are right; the backend log shows `[4K]` lines per camera

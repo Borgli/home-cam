@@ -9,6 +9,17 @@ async function request(url, options = {}) {
   return res.json();
 }
 
+// Like request(), but hands back the status and the JSON body (with its error message) instead of throwing
+async function fetchJson(url, options = {}) {
+  try {
+    const res = await fetch(`${API_BASE}${url}`, options);
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, data };
+  } catch {
+    return { ok: false, status: 0, data: { error: 'Backend unreachable' } };
+  }
+}
+
 export const api = {
   // Config
   getConfig: () => request('/get_config'),
@@ -51,4 +62,13 @@ export const api = {
 
   // Video feed URL (not a fetch, used as img src)
   videoFeedUrl: (channel) => `/video_feed/${channel}`,
+
+  // 4K view: the NVR's 4K main stream, at most 2 cameras at once (the NVR's limit)
+  hdStart: (channel) => fetchJson(`/api/hd/${channel}`, { method: 'POST' }),
+  hdStop: (channel) => fetch(`${API_BASE}/api/hd/${channel}`, { method: 'DELETE' }).catch(() => {}),
+  // JPEG of the region x0..x1, y0..y1 (0-1) of the newest 4K frame, `width` pixels wide
+  hdFrameUrl: (channel, { x0, y0, x1, y1, width }) => `${API_BASE}/api/hd/${channel}/frame?${new URLSearchParams({
+    x0: x0.toFixed(5), y0: y0.toFixed(5), x1: x1.toFixed(5), y1: y1.toFixed(5), w: String(width),
+  })}`,
+  hdSnapshotUrl: (channel) => `${API_BASE}/api/hd/${channel}/snapshot`,
 };
