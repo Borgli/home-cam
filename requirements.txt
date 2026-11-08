@@ -15,6 +15,7 @@ redis>=5.2.0
 opencv-python>=4.11.0.86
 ultralytics>=8.4.208  # tested version; adds OC-SORT/Deep OC-SORT/TrackTrack and fixed ReID
 lap>=0.5.12  # needed by Ultralytics trackers (BoT-SORT/ByteTrack)
+av>=14.0.0  # PyAV: decodes the NVR's 4K H.265 streams, on the GPU where possible (reolink_native.py)
 torch>=2.5.0
 torchvision>=0.20.0
 numpy>=2.0.0

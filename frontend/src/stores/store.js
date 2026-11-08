@@ -28,6 +28,15 @@ export const useStore = create((set, get) => ({
   expandedCamera: null,
   setExpandedCamera: (channel) => set({ expandedCamera: channel }),
 
+  // Cameras showing the 4K view (channel -> true); kept here so it survives expand/collapse
+  hdChannels: {},
+  setHdChannel: (channel, on) => {
+    const next = { ...get().hdChannels };
+    if (on) next[channel] = true;
+    else delete next[channel];
+    set({ hdChannels: next });
+  },
+
   // Events
   events: [],
   setEvents: (events) => set({ events }),

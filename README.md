@@ -7,6 +7,7 @@ AI-powered surveillance system with real-time object detection, tracking, and a 
 - **YOLO26 Object Detection** - Real-time detection with 80 COCO classes on live camera feeds
 - **TrackTrack Tracking with Re-ID** - Appearance-based re-identification so tracked objects keep their IDs even after temporary occlusion
 - **4-Camera Grid** - Monitor up to 4 NVR channels simultaneously with zoom and fullscreen
+- **4K View** - Zoom into a camera at its full 3840x2160 resolution (two cameras at a time, an NVR limit) and open full-resolution stills
 - **Drawing Tools** - Privacy zones, counting zones, and crossing lines drawn directly on camera feeds
 - **Privacy Zone Masking** - Drawn privacy zones are applied server-side before detection, truly hiding regions from YOLO
 - **Movement Trails** - TraceAnnotator draws motion paths behind tracked objects
@@ -25,7 +26,7 @@ AI-powered surveillance system with real-time object detection, tracking, and a 
 
 - Python 3.10+
 - Node.js 20+ (for the React frontend)
-- Reolink NVR with FLV streaming enabled
+- Reolink NVR with FLV streaming enabled (and its media port, 9000, reachable for the 4K view)
 
 ### Installation
 
@@ -116,6 +117,7 @@ Flask Backend (REST API + MJPEG)     React Frontend (Vite + Tailwind)
 home-cam/
 ├── batched_viewer.py            # Main backend: cameras, detection, tracking, API
 ├── simple_viewer.py             # Simpler single-process viewer (no tracking)
+├── reolink_native.py            # 4K streams over Reolink's native protocol (port 9000)
 ├── surveillance_tracker.yaml    # TrackTrack + Re-ID tracker config (botsort_tracker.yaml: alternative)
 ├── requirements.txt             # Python dependencies
 ├── .env                         # Configuration (not in git)
@@ -184,6 +186,18 @@ home-cam/
 | `/api/db/query` | POST | Execute a read-only SQL query |
 | `/api/db/llm-query` | POST | Natural language to SQL via Ollama |
 | `/api/db/schema` | GET | Database schema (for LLM context) |
+
+### 4K view (batched_viewer.py + reolink_native.py)
+
+The NVR only relays the cameras' H.265 4K streams over Reolink's native protocol, at most two at once. See `AGENTS.md` (4K Streams) for why and how.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/hd/<channel>` | POST | Start a camera's 4K stream (409 when two are already running) |
+| `/api/hd/<channel>` | DELETE | Stop it |
+| `/api/hd/<channel>/frame` | GET | JPEG of a region of the newest 4K frame (`x0`, `y0`, `x1`, `y1` in 0-1, width `w`) |
+| `/api/hd/<channel>/snapshot` | GET | Full-resolution still |
+| `/api/hd/status` | GET | Running 4K streams and the limit |
 
 ## YOLO Models
 
