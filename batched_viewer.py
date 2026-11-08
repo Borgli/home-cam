@@ -11,14 +11,15 @@ import threading
 import time
 import os
 from dotenv import load_dotenv
-from ultralytics import YOLO
 import supervision as sv
 import numpy as np
 import torch
 from collections import deque
 
-# Load environment variables
+# Load environment variables (before inference_backend reads YOLO_DEVICE)
 load_dotenv()
+
+from inference_backend import select_backend, cpu_backend
 
 app = Flask(__name__)
 CORS(app)
@@ -72,46 +73,23 @@ metrics_lock = threading.Lock()
 
 # Initialize YOLO model with configuration from environment
 YOLO_MODEL = os.getenv('YOLO_MODEL', 'yolo26n.pt')
-YOLO_DEVICE = os.getenv('YOLO_DEVICE', 'cpu')
 BATCH_SIZE = 4  # Number of cameras we process in batch
 
-print(f"\n[INFO] Loading {YOLO_MODEL} on {YOLO_DEVICE.upper()}...")
-print(f"[INFO] Batch processing mode enabled for {BATCH_SIZE} cameras")
-
+# Pick the fastest backend for this PC (CUDA, OpenVINO on Intel, or PyTorch CPU).
+# YOLO_DEVICE in .env: auto (default), cpu, cuda, intel:gpu, intel:cpu, intel:npu.
+print(f"\n[INFO] Choosing inference backend for {YOLO_MODEL}...")
 try:
-    model = YOLO(YOLO_MODEL)
-    if YOLO_DEVICE.lower() == 'cuda' or YOLO_DEVICE.startswith('0'):
-        model.to('cuda')
-
-        # Check if a TensorRT engine exists with proper batch size
-        engine_path = f"{YOLO_MODEL.split('.')[0]}_batch{BATCH_SIZE}.engine"
-
-        if os.path.exists(engine_path):
-            print(f"[INFO] Found existing TensorRT engine: {engine_path}")
-            try:
-                model = YOLO(engine_path)
-                print(f"[OK] Loaded TensorRT engine with batch size {BATCH_SIZE}")
-                USE_GPU = True
-            except Exception as e:
-                print(f"[WARN] Failed to load existing engine: {e}")
-                print(f"[INFO] Using PyTorch model on GPU instead")
-                model = YOLO(YOLO_MODEL)
-                model.to('cuda')
-                USE_GPU = True
-        else:
-            model.export(format='engine', batch=4, dynamic=True)
-            print(f"[INFO] No TensorRT engine found. Using PyTorch model on GPU")
-            print(f"[INFO] For better performance, export with: model.export(format='engine', batch={BATCH_SIZE}, dynamic=True)")
-            USE_GPU = True
-    else:
-        print(f"[OK] {YOLO_MODEL} loaded on CPU")
-        USE_GPU = False
+    BACKEND = select_backend(YOLO_MODEL, BATCH_SIZE)
+    model, single_model = BACKEND.load_models()  # batched mode / sequential mode
 except Exception as e:
-    print(f"[ERROR] Failed to load model: {e}")
-    # Fallback to nano model on CPU
-    model = YOLO("yolo26n.pt")
-    print("[OK] Fallback: yolo26n.pt loaded on CPU")
-    USE_GPU = False
+    print(f"[ERROR] Failed to load {YOLO_MODEL}: {e}")
+    YOLO_MODEL = 'yolo26n.pt'
+    BACKEND = cpu_backend(YOLO_MODEL, f'fallback after failing to load {os.getenv("YOLO_MODEL")}')
+    model, single_model = BACKEND.load_models()
+YOLO_DEVICE = BACKEND.device
+USE_GPU = BACKEND.uses_cuda  # CUDA only: enables torch.cuda memory metrics
+print(f"[OK] Inference backend: {BACKEND.label}")
+print(f"     Reason: {BACKEND.reason}")
 
 # Initialize supervision annotators
 box_annotator = sv.BoxAnnotator(thickness=2)
@@ -119,17 +97,15 @@ label_annotator = sv.LabelAnnotator(text_thickness=1, text_scale=0.5)
 trace_annotators = {ch: sv.TraceAnnotator(thickness=2, trace_length=60) for ch in range(4)}
 smoothers = {ch: sv.DetectionsSmoother(length=5) for ch in range(4)}
 
-# Tracker config path for BoT-SORT + Re-ID
-TRACKER_CONFIG = os.path.join(os.path.dirname(__file__), 'surveillance_tracker.yaml')
+# Tracker config path for BoT-SORT + Re-ID. On PCs where OpenVINO runs the Re-ID encoder
+# faster, this becomes a generated copy in model_cache/ (same settings, OpenVINO encoder).
+TRACKER_CONFIG = BACKEND.tracker_config(os.path.join(os.path.dirname(__file__), 'surveillance_tracker.yaml'))
+print(f"[OK] Tracking Re-ID: {BACKEND.reid_label}")
 
 # Per-camera model instances for model.track(persist=True)
 # Each camera needs its own model instance to maintain independent tracking state
 print("\n[INFO] Initializing BoT-SORT trackers with Re-ID per camera...")
-tracker_models = {}
-for channel in range(4):
-    tracker_models[channel] = YOLO(YOLO_MODEL)
-    if USE_GPU:
-        tracker_models[channel].to('cuda')
+tracker_models = {channel: BACKEND.load_single_model() for channel in range(4)}
 print(f"[OK] BoT-SORT + Re-ID trackers initialized for all channels (config: {TRACKER_CONFIG})")
 
 # Get token once for all channels
@@ -315,17 +291,17 @@ def batch_detection_thread():
                 results_batch = []
                 for frame, channel in zip(frames_batch, channels_in_batch):
                     result = tracker_models[channel].track(
-                        frame, persist=True, tracker=TRACKER_CONFIG, verbose=False
+                        frame, persist=True, tracker=TRACKER_CONFIG, device=BACKEND.device, verbose=False
                     )
                     results_batch.append(result[0] if isinstance(result, list) else result)
             elif current_batched_mode:
                 # BATCHED MODE: Process all frames in a single forward pass
-                results_batch = model(frames_batch, verbose=False)
+                results_batch = BACKEND.predict_batch(model, frames_batch)
             else:
                 # SEQUENTIAL MODE: Process each frame separately
                 results_batch = []
                 for frame in frames_batch:
-                    result = model(frame, verbose=False)
+                    result = single_model(frame, device=BACKEND.device, verbose=False)
                     results_batch.append(result[0] if isinstance(result, list) else result)
 
             inference_time = (time.time() - inference_start) * 1000  # ms
@@ -744,7 +720,7 @@ def index():
     <body>
         <h1>📹 4-CHANNEL NVR - BATCHED YOLO DETECTION 📹</h1>
         <div class="info">
-            <p>NVR: {NVR_IP} | Model: {YOLO_MODEL} ({YOLO_DEVICE.upper()}) | Cameras: {camera_count}/4</p>
+            <p>NVR: {NVR_IP} | Model: {YOLO_MODEL} ({BACKEND.label}) | Cameras: {camera_count}/4</p>
         </div>
         
         <div class="batch-info">
@@ -1059,9 +1035,7 @@ def toggle_tracking():
         print("\n[INFO] Object tracking disabled")
         # Reload tracker models to clear persisted tracking state
         for channel in tracker_models:
-            tracker_models[channel] = YOLO(YOLO_MODEL)
-            if USE_GPU:
-                tracker_models[channel].to('cuda')
+            tracker_models[channel] = BACKEND.load_single_model()
 
     return jsonify({
         'tracking_enabled': TRACKING_ENABLED,
@@ -1115,7 +1089,8 @@ def get_config():
             'batched_mode': BATCHED_MODE,
             'auto_fps': AUTO_FPS,
             'target_fps': TARGET_FPS,
-            'tracking_enabled': TRACKING_ENABLED
+            'tracking_enabled': TRACKING_ENABLED,
+            'inference_backend': BACKEND.to_dict()
         })
 
 
@@ -1484,15 +1459,25 @@ def comparison():
                         'If memory is limited, use a smaller model or reduce batch size'
                     ]
                 })
+        elif BACKEND.kind == 'openvino':
+            recommendations.append({
+                'level': 'info',
+                'title': 'OpenVINO Acceleration',
+                'message': f'Inference runs on {BACKEND.label}. {BACKEND.reason}.',
+                'actions': [
+                    'Set YOLO_REBENCHMARK=1 in .env to measure the backends again',
+                    'A larger model (e.g. YOLO_MODEL=yolo26s.pt) may now fit the frame budget'
+                ]
+            })
         else:
             recommendations.append({
                 'level': 'critical',
                 'title': 'CPU Mode Detected',
-                'message': 'Running on CPU significantly reduces batch processing benefits.',
+                'message': f'Running on CPU significantly reduces batch processing benefits ({BACKEND.reason}).',
                 'actions': [
-                    'Install CUDA and PyTorch with GPU support for massive speedup',
-                    'Set YOLO_DEVICE=cuda in .env file',
-                    'Expected 10-50x performance improvement with GPU'
+                    'With an NVIDIA GPU: install PyTorch with CUDA support (YOLO_DEVICE=auto picks it up)',
+                    'With an Intel CPU or GPU: pip install openvino and set YOLO_DEVICE=auto',
+                    'Expected 3-50x performance improvement with GPU acceleration'
                 ]
             })
 
@@ -1591,7 +1576,7 @@ def comparison():
                     </tr>
                     <tr>
                         <td>Device</td>
-                        <td id="device">{"GPU (CUDA)" if USE_GPU else "CPU"}</td>
+                        <td id="device">{BACKEND.label}</td>
                         <td>Hardware being used for inference</td>
                     </tr>
                 </table>
@@ -1797,6 +1782,7 @@ def api_comparison_metrics():
             'max_fps': (1000 / avg_batch_time) if avg_batch_time > 0 else 0,
             'gpu_memory': gpu_memory,
             'use_gpu': USE_GPU,
+            'backend': BACKEND.label,
             'has_data': avg_batch_time > 0 or avg_inference_time > 0
         })
 
@@ -1856,13 +1842,12 @@ def api_metrics():
 
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print("Starting 4-camera grid viewer with BATCHED YOLOv11 detection...")
+    print("Starting 4-camera grid viewer with BATCHED YOLO detection...")
     print(f"Configuration from .env:")
     print(f"  NVR IP: {NVR_IP}")
     print(f"  YOLO Model: {YOLO_MODEL}")
-    print(f"  Device: {YOLO_DEVICE.upper()}")
+    print(f"  Inference: {BACKEND.label}")
     print(f"  Batch Processing: ENABLED")
-    print(f"  GPU Available: {USE_GPU}")
     print("Open browser: http://localhost:5001")
     print("="*60 + "\n")
 

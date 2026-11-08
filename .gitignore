@@ -37,6 +37,8 @@ build/
 *.onnx
 *.engine
 yolo*.pt
+model_cache/
+*_openvino_model/
 
 # Outputs
 snaps/
