@@ -1,6 +1,6 @@
 import { useStore } from '../../stores/store';
 import { api } from '../../api/client';
-import { Eye, EyeOff, Crosshair, Zap, Gauge } from 'lucide-react';
+import { Eye, EyeOff, Crosshair, Zap, Gauge, Cpu } from 'lucide-react';
 
 function StatusPill({ active, label, icon: Icon, onClick, color = 'green' }) {
   const colors = {
@@ -25,6 +25,7 @@ export default function Header() {
   const config = useStore(s => s.config);
   const batchStats = useStore(s => s.batchStats);
   const setConfig = useStore(s => s.setConfig);
+  const backend = config.inference_backend;
 
   const toggle = async (fn, key) => {
     try {
@@ -66,17 +67,30 @@ export default function Header() {
         />
       </div>
 
-      {/* Batch stats */}
-      {batchStats && (
-        <div className="flex items-center gap-4 text-xs font-mono text-gray-500">
-          <span>Batch: <span className="text-neon-amber">{batchStats.avg_batch_time}ms</span></span>
-          <span>Inference: <span className="text-neon-cyan">{batchStats.avg_inference_time}ms</span></span>
-          <span>Efficiency: <span className="text-neon-green">{batchStats.avg_efficiency}x</span></span>
-          {batchStats.gpu_memory !== '0' && (
-            <span>GPU: <span className="text-neon-magenta">{batchStats.gpu_memory}MB</span></span>
-          )}
-        </div>
-      )}
+      <div className="flex items-center gap-4 text-xs font-mono text-gray-500 min-w-0">
+        {/* Inference backend chosen for this PC */}
+        {backend && (
+          <span
+            title={`${backend.reason}${backend.reid ? `\nTracking Re-ID: ${backend.reid}` : ''}`}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-border bg-white/5 text-gray-300 truncate"
+          >
+            <Cpu className="w-3.5 h-3.5 shrink-0 text-neon-cyan" />
+            <span className="truncate">{backend.label}</span>
+          </span>
+        )}
+
+        {/* Batch stats */}
+        {batchStats && (
+          <>
+            <span>Batch: <span className="text-neon-amber">{batchStats.avg_batch_time}ms</span></span>
+            <span>Inference: <span className="text-neon-cyan">{batchStats.avg_inference_time}ms</span></span>
+            <span>Efficiency: <span className="text-neon-green">{batchStats.avg_efficiency}x</span></span>
+            {batchStats.gpu_memory !== '0' && (
+              <span>GPU: <span className="text-neon-magenta">{batchStats.gpu_memory}MB</span></span>
+            )}
+          </>
+        )}
+      </div>
     </header>
   );
 }

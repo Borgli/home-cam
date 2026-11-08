@@ -12,8 +12,11 @@ A real-time multi-camera surveillance system that connects to a Reolink NVR, run
 home-cam/
 ├── batched_viewer.py            # THE MAIN FILE - Flask backend, camera streams,
 │                                # YOLO detection, tracking, metrics, MJPEG serving
+├── inference_backend.py         # Picks CUDA / OpenVINO / PyTorch-CPU per PC (benchmark + cache)
+├── openvino_reid.py             # Runs the tracker's Re-ID encoder on OpenVINO where that is faster
 ├── simple_viewer.py             # Simpler alternative (sequential detection, no tracking)
 ├── surveillance_tracker.yaml    # BoT-SORT tracker config (Re-ID, fixed cameras)
+├── model_cache/                 # OpenVINO exports + per-PC backend benchmark (auto-created, gitignored)
 ├── requirements.txt             # Python deps (flask, ultralytics, supervision, etc.)
 ├── .env                         # Runtime config - NVR credentials, model, device
 ├── .env.example                 # Template for .env (safe to commit)
@@ -148,7 +151,8 @@ All config is in `.env`. Key settings:
 | `REOLINK_USERNAME` | `admin` | NVR login |
 | `REOLINK_PASSWORD` | (required) | NVR password |
 | `YOLO_MODEL` | `yolo26n.pt` | Detection model (downloaded automatically) |
-| `YOLO_DEVICE` | `cpu` | `cpu` or `cuda` for GPU |
+| `YOLO_DEVICE` | `auto` | `auto` picks the fastest backend on this PC (see below); or force `cpu`, `cuda`, `intel:gpu`, `intel:cpu`, `intel:npu` |
+| `YOLO_REBENCHMARK` | `0` | `1` re-runs the backend benchmark on the next start |
 | `YOLO_CONFIDENCE` | `0.5` | Minimum detection confidence |
 
 **Do not commit `.env`** - it contains NVR credentials. It is gitignored.
@@ -198,7 +202,26 @@ Edit `surveillance_tracker.yaml`. Key options:
 
 ### Changing the YOLO Model
 
-Set `YOLO_MODEL=yolo26s.pt` (or m/l/x) in `.env`. The model downloads automatically on first run. Larger models are more accurate but slower, especially on CPU.
+Set `YOLO_MODEL=yolo26s.pt` (or m/l/x) in `.env`. The model downloads automatically on first run. Larger models are more accurate but slower, especially on CPU. With `YOLO_DEVICE=auto`, a new model triggers a one-time OpenVINO export and benchmark on Intel PCs.
+
+### Inference Backends (running on different PCs)
+
+`inference_backend.py` decides how YOLO runs, once per PC, when `YOLO_DEVICE=auto`:
+
+1. **NVIDIA GPU** visible to PyTorch → PyTorch on CUDA (or `<model>_batch4.engine` if a TensorRT engine exists). No benchmark.
+2. **OpenVINO installed** → exports the model to OpenVINO IR (batch 1 and batch 4, FP16) into `model_cache/`, then times PyTorch-CPU against OpenVINO on every Intel device (iGPU/Arc GPU, CPU, NPU) on a 4-frame batch. OpenVINO is used only if it is at least 15% faster (`MIN_SPEEDUP`).
+3. Otherwise → PyTorch on the CPU.
+
+The decision is cached in `model_cache/backend_choice.json`, keyed by hostname, hardware and library versions, so the same checkout works across PCs. OpenVINO models have a fixed batch size: `BACKEND.predict_batch()` pads partial batches (e.g. a camera offline), and sequential mode and tracking use the batch-1 export. The active backend is exposed as `inference_backend` in `GET /get_config` and shown in the dashboard header.
+
+**Tracking Re-ID.** With YOLO26 (end-to-end head), BoT-SORT's `model: auto` can't reuse detector features, so Ultralytics runs a separate `yolo26n-cls.pt` encoder on a crop of every detected object. The same one-time benchmark times that encoder (PyTorch vs OpenVINO per device, for 1 and 4 objects). Where OpenVINO is at least 15% faster, `BACKEND.tracker_config()`:
+1. exports the classifier backbone + average pooling to `model_cache/yolo26n-cls_reid_openvino_model/` (same embedding as Ultralytics' path, cosine similarity 1.0),
+2. hooks Ultralytics' `ReID` class (`ultralytics.trackers.utils.reid`, or `bot_sort` in older versions) so that model path returns `openvino_reid.OpenVINOReID` on the benchmarked device,
+3. writes `model_cache/tracker_openvino_reid.yaml`: a copy of `surveillance_tracker.yaml` with `model:` pointing at the export. Edit `surveillance_tracker.yaml`, never the generated file.
+
+If the hook point is missing, the config sets an explicit `model:`, or anything fails, tracking keeps `surveillance_tracker.yaml` and Ultralytics' default Re-ID. A hook is used instead of only pointing `model:` at the export because Ultralytics would then run the encoder on the detector's PyTorch device and couldn't target the benchmarked OpenVINO device.
+
+Newer tracker options in Ultralytics (not enabled here): `tracker_type` `tracktrack` (Ultralytics' default), `ocsort`, `deepocsort`, `fasttrack`, and dedicated Re-ID models `yolo26{n,s,m,l,x}-reid.onnx` (448 px). Setting one of those as `model:` bypasses the OpenVINO encoder and runs it through Ultralytics directly.
 
 ## Database
 
@@ -225,5 +248,6 @@ SQL queries from the frontend are restricted to SELECT only for safety.
 - **"REOLINK_PASSWORD must be set"**: Create `.env` from `.env.example` and set your NVR password
 - **Model download slow**: YOLO models (~5MB for nano) download from GitHub on first run
 - **Frontend can't reach backend**: Ensure backend is running on port 5001 before starting frontend
-- **Tracking is slow on CPU**: Tracking uses per-camera inference (not batched). Consider `YOLO_DEVICE=cuda` if GPU available
+- **Tracking is slow on CPU**: Tracking uses per-camera inference (not batched). Keep `YOLO_DEVICE=auto` so a CUDA or Intel GPU is used when available
+- **Backend choice looks wrong after a driver or hardware change**: set `YOLO_REBENCHMARK=1` (or delete `model_cache/backend_choice.json`) and restart
 - **Privacy zones not blocking detections**: Backend must be restarted after the `backend_api` code was added. Zones are loaded from SQLite every 2 seconds

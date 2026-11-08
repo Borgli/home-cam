@@ -54,8 +54,10 @@ REOLINK_IP=192.168.2.112
 REOLINK_USERNAME=admin
 REOLINK_PASSWORD=your_password
 YOLO_MODEL=yolo26n.pt
-YOLO_DEVICE=cpu               # or cuda for GPU
+YOLO_DEVICE=auto              # or cpu | cuda | intel:gpu | intel:cpu | intel:npu
 ```
+
+With `YOLO_DEVICE=auto` each PC picks its own inference backend at startup: an NVIDIA GPU (CUDA) if there is one, otherwise OpenVINO on Intel hardware when a short benchmark shows it is faster than PyTorch on the CPU, otherwise PyTorch on the CPU. The first start on a PC exports the model to OpenVINO and benchmarks (about a minute); the result is cached in `model_cache/`. The dashboard header shows which backend is in use.
 
 ### Running
 
