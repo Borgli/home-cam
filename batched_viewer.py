@@ -97,16 +97,39 @@ label_annotator = sv.LabelAnnotator(text_thickness=1, text_scale=0.5)
 trace_annotators = {ch: sv.TraceAnnotator(thickness=2, trace_length=60) for ch in range(4)}
 smoothers = {ch: sv.DetectionsSmoother(length=5) for ch in range(4)}
 
-# Tracker config path for BoT-SORT + Re-ID. On PCs where OpenVINO runs the Re-ID encoder
-# faster, this becomes a generated copy in model_cache/ (same settings, OpenVINO encoder).
-TRACKER_CONFIG = BACKEND.tracker_config(os.path.join(os.path.dirname(__file__), 'surveillance_tracker.yaml'))
-print(f"[OK] Tracking Re-ID: {BACKEND.reid_label}")
+# Tracker config: TRACKER_CONFIG in .env, default surveillance_tracker.yaml (TrackTrack + Re-ID).
+# On PCs where OpenVINO runs the Re-ID encoder faster, this becomes a generated copy in
+# model_cache/ (same settings, OpenVINO encoder).
+_tracker_file = os.getenv('TRACKER_CONFIG') or 'surveillance_tracker.yaml'
+if not os.path.isabs(_tracker_file):
+    _tracker_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), _tracker_file)
+TRACKER_CONFIG = BACKEND.tracker_config(_tracker_file)
+TRACKER_NAMES = {'botsort': 'BoT-SORT', 'bytetrack': 'ByteTrack', 'tracktrack': 'TrackTrack',
+                 'ocsort': 'OC-SORT', 'deepocsort': 'Deep OC-SORT', 'fasttrack': 'FastTracker'}
+
+
+def _tracker_info():
+    """Tracker type and Re-ID setting from the active tracker config, for logs and the dashboard."""
+    import yaml
+    try:
+        with open(TRACKER_CONFIG, encoding='utf-8') as f:
+            cfg = yaml.safe_load(f) or {}
+    except (OSError, ValueError):
+        cfg = {}
+    kind = cfg.get('tracker_type', 'botsort')
+    reid = bool(cfg.get('with_reid'))
+    return {'type': kind, 'name': TRACKER_NAMES.get(kind, kind), 'reid': reid,
+            'reid_label': BACKEND.reid_label if reid else 'off'}
+
+
+TRACKER_INFO = _tracker_info()
+TRACKER_LABEL = f"{TRACKER_INFO['name']}{' + Re-ID' if TRACKER_INFO['reid'] else ''}"
+print(f"[OK] Tracker: {TRACKER_LABEL} (Re-ID: {TRACKER_INFO['reid_label']})")
 
 # Per-camera model instances for model.track(persist=True)
 # Each camera needs its own model instance to maintain independent tracking state
-print("\n[INFO] Initializing BoT-SORT trackers with Re-ID per camera...")
 tracker_models = {channel: BACKEND.load_single_model() for channel in range(4)}
-print(f"[OK] BoT-SORT + Re-ID trackers initialized for all channels (config: {TRACKER_CONFIG})")
+print(f"[OK] {TRACKER_LABEL} trackers initialized for all channels (config: {TRACKER_CONFIG})")
 
 # Get token once for all channels
 print(f"\nConnecting to NVR at {NVR_IP}...")
@@ -286,7 +309,7 @@ def batch_detection_thread():
             inference_start = time.time()
 
             if TRACKING_ENABLED:
-                # TRACKING MODE: Use per-camera model.track() with BoT-SORT + Re-ID
+                # TRACKING MODE: Use per-camera model.track() with the configured tracker (+ Re-ID)
                 # Cannot batch when tracking because each camera needs persistent state
                 results_batch = []
                 for frame, channel in zip(frames_batch, channels_in_batch):
@@ -1030,7 +1053,7 @@ def toggle_tracking():
 
     # Reset tracker models when toggling to clear persisted state
     if TRACKING_ENABLED:
-        print("\n[INFO] Object tracking enabled - BoT-SORT with Re-ID active")
+        print(f"\n[INFO] Object tracking enabled - {TRACKER_LABEL} active")
     else:
         print("\n[INFO] Object tracking disabled")
         # Reload tracker models to clear persisted tracking state
@@ -1090,7 +1113,9 @@ def get_config():
             'auto_fps': AUTO_FPS,
             'target_fps': TARGET_FPS,
             'tracking_enabled': TRACKING_ENABLED,
-            'inference_backend': BACKEND.to_dict()
+            'inference_backend': BACKEND.to_dict(),
+            'model': YOLO_MODEL,
+            'tracker': TRACKER_INFO
         })
 
 

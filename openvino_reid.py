@@ -33,6 +33,7 @@ import torch
 from PIL import Image
 
 REID_WEIGHTS = 'yolo26n-cls.pt'
+REID_TRACKERS = {'botsort', 'tracktrack', 'deepocsort'}  # trackers that build Ultralytics' ReID encoder
 CACHE_DIR = Path(__file__).resolve().parent / 'model_cache'
 
 _shared_encoders: dict[tuple[str, str], 'OpenVINOReID'] = {}
@@ -152,12 +153,14 @@ def install(model_dir: str | Path, ov_device: str) -> bool:
 def write_tracker_config(base_yaml: str | Path, model_dir: str | Path) -> Path | None:
     """Copy the tracker config with `model:` pointing at the OpenVINO encoder.
 
-    Returns None (keep base_yaml) unless it is BoT-SORT with Re-ID on and model: auto.
+    Returns None (keep base_yaml) unless the tracker uses Ultralytics' ReID encoder (BoT-SORT, TrackTrack,
+    Deep OC-SORT) with Re-ID on and model: auto.
     """
     import yaml
 
     cfg = yaml.safe_load(Path(base_yaml).read_text(encoding='utf-8')) or {}
-    if cfg.get('tracker_type') != 'botsort' or not cfg.get('with_reid') or str(cfg.get('model', 'auto')) != 'auto':
+    if (cfg.get('tracker_type') not in REID_TRACKERS or not cfg.get('with_reid')
+            or str(cfg.get('model', 'auto')) != 'auto'):
         return None
     cfg['model'] = str(Path(model_dir).resolve())
     out = CACHE_DIR / 'tracker_openvino_reid.yaml'

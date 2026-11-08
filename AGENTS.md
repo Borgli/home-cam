@@ -4,7 +4,7 @@ This file explains the home-cam surveillance system for AI agents and developers
 
 ## What This Project Is
 
-A real-time multi-camera surveillance system that connects to a Reolink NVR, runs YOLO26 object detection on 4 camera feeds simultaneously, tracks objects with BoT-SORT + Re-ID, persists detections to SQLite, and serves everything through a React dashboard.
+A real-time multi-camera surveillance system that connects to a Reolink NVR, runs YOLO26 object detection on 4 camera feeds simultaneously, tracks objects with TrackTrack + Re-ID, persists detections to SQLite, and serves everything through a React dashboard.
 
 ## Repository Layout
 
@@ -15,7 +15,8 @@ home-cam/
 ├── inference_backend.py         # Picks CUDA / OpenVINO / PyTorch-CPU per PC (benchmark + cache)
 ├── openvino_reid.py             # Runs the tracker's Re-ID encoder on OpenVINO where that is faster
 ├── simple_viewer.py             # Simpler alternative (sequential detection, no tracking)
-├── surveillance_tracker.yaml    # BoT-SORT tracker config (Re-ID, fixed cameras)
+├── surveillance_tracker.yaml    # Default tracker config: TrackTrack + Re-ID, fixed cameras
+├── botsort_tracker.yaml         # Alternative: BoT-SORT + Re-ID (TRACKER_CONFIG in .env)
 ├── model_cache/                 # OpenVINO exports + per-PC backend benchmark (auto-created, gitignored)
 ├── requirements.txt             # Python deps (flask, ultralytics, supervision, etc.)
 ├── .env                         # Runtime config - NVR credentials, model, device
@@ -67,7 +68,7 @@ home-cam/
 1. **Frame Capture**: 4 threads continuously read FLV streams from the Reolink NVR via HTTP token auth
 2. **Privacy Masking**: Before detection, privacy zone regions (from SQLite) are blacked out on the frame
 3. **Detection**: YOLO26 runs on the (masked) frames - batched (4 at once) or per-camera when tracking
-4. **Tracking**: When enabled, `model.track(persist=True)` runs BoT-SORT with Re-ID per camera
+4. **Tracking**: When enabled, `model.track(persist=True)` runs the configured tracker (TrackTrack + Re-ID by default) per camera
 5. **Smoothing**: `DetectionsSmoother` reduces bounding box jitter on tracked objects
 6. **Annotation**: Bounding boxes, labels, and movement trails are drawn on the frame
 7. **Streaming**: Annotated frames are JPEG-encoded and served as MJPEG multipart streams
@@ -153,6 +154,7 @@ All config is in `.env`. Key settings:
 | `YOLO_MODEL` | `yolo26n.pt` | Detection model (downloaded automatically) |
 | `YOLO_DEVICE` | `auto` | `auto` picks the fastest backend on this PC (see below); or force `cpu`, `cuda`, `intel:gpu`, `intel:cpu`, `intel:npu` |
 | `YOLO_REBENCHMARK` | `0` | `1` re-runs the backend benchmark on the next start |
+| `TRACKER_CONFIG` | `surveillance_tracker.yaml` | Tracker config file (`botsort_tracker.yaml` for BoT-SORT) |
 | `YOLO_CONFIDENCE` | `0.5` | Minimum detection confidence |
 
 **Do not commit `.env`** - it contains NVR credentials. It is gitignored.
@@ -194,11 +196,18 @@ Detection happens in `batched_viewer.py` in `batch_detection_thread()`. The flow
 
 ### Changing the Tracker
 
-Edit `surveillance_tracker.yaml`. Key options:
-- `tracker_type`: `botsort` or `bytetrack`
-- `with_reid`: `true`/`false` - appearance-based re-identification
-- `track_buffer`: Frames to remember lost tracks (higher = more persistent IDs)
+`TRACKER_CONFIG` in `.env` picks the tracker config file (default `surveillance_tracker.yaml`):
+- `surveillance_tracker.yaml`: **TrackTrack + Re-ID** (default), tuned for fixed cameras
+- `botsort_tracker.yaml`: BoT-SORT + Re-ID (the previous default)
+
+Key options:
+- `tracker_type`: `tracktrack`, `botsort`, `bytetrack`, `ocsort`, `deepocsort`, `fasttrack` (Ultralytics ≥ 8.4.63)
+- `with_reid`: `true`/`false` - appearance-based re-identification (TrackTrack, BoT-SORT, Deep OC-SORT)
+- `track_buffer`: frames to remember lost tracks (higher = more persistent IDs)
+- `track_high_thresh` / `new_track_thresh`: keep at or below the app's 0.5 confidence filter, or confident detections go untracked
 - `gmc_method`: `none` for fixed cameras, `sparseOptFlow` for moving cameras
+
+Why TrackTrack (Nov 2026): all six Ultralytics trackers were run on the same 90 s recording from all 4 cameras (night, mostly static scene), with the same OpenVINO detector and synthetic occlusions. TrackTrack with thresholds at 0.5 created 4 IDs vs 10 for BoT-SORT + Re-ID, re-labelled no objects, tracked 99.9% of confident detections, and cost ~36 vs ~78 ms per frame. Every tracker recovered all synthetic occlusions, and the footage had no people or cars moving, so check behaviour in daylight with motion before tuning further. With Ultralytics' default thresholds (0.6/0.7), TrackTrack left ~10% of confident detections untracked.
 
 ### Changing the YOLO Model
 
@@ -214,14 +223,14 @@ Set `YOLO_MODEL=yolo26s.pt` (or m/l/x) in `.env`. The model downloads automatica
 
 The decision is cached in `model_cache/backend_choice.json`, keyed by hostname, hardware and library versions, so the same checkout works across PCs. OpenVINO models have a fixed batch size: `BACKEND.predict_batch()` pads partial batches (e.g. a camera offline), and sequential mode and tracking use the batch-1 export. The active backend is exposed as `inference_backend` in `GET /get_config` and shown in the dashboard header.
 
-**Tracking Re-ID.** With YOLO26 (end-to-end head), BoT-SORT's `model: auto` can't reuse detector features, so Ultralytics runs a separate `yolo26n-cls.pt` encoder on a crop of every detected object. The same one-time benchmark times that encoder (PyTorch vs OpenVINO per device, for 1 and 4 objects). Where OpenVINO is at least 15% faster, `BACKEND.tracker_config()`:
+**Tracking Re-ID.** With YOLO26 (end-to-end head), the trackers' `model: auto` can't reuse detector features, so Ultralytics runs a separate `yolo26n-cls.pt` encoder on a crop of every detected object. The same one-time benchmark times that encoder (PyTorch vs OpenVINO per device, for 1 and 4 objects). Where OpenVINO is at least 15% faster, `BACKEND.tracker_config()`:
 1. exports the classifier backbone + average pooling to `model_cache/yolo26n-cls_reid_openvino_model/` (same embedding as Ultralytics' path, cosine similarity 1.0),
 2. hooks Ultralytics' `ReID` class (`ultralytics.trackers.utils.reid`, or `bot_sort` in older versions) so that model path returns `openvino_reid.OpenVINOReID` on the benchmarked device,
-3. writes `model_cache/tracker_openvino_reid.yaml`: a copy of `surveillance_tracker.yaml` with `model:` pointing at the export. Edit `surveillance_tracker.yaml`, never the generated file.
+3. writes `model_cache/tracker_openvino_reid.yaml`: a copy of the selected tracker config (`TRACKER_CONFIG`) with `model:` pointing at the export. Edit the source config, never the generated file. This applies to TrackTrack, BoT-SORT and Deep OC-SORT configs.
 
-If the hook point is missing, the config sets an explicit `model:`, or anything fails, tracking keeps `surveillance_tracker.yaml` and Ultralytics' default Re-ID. A hook is used instead of only pointing `model:` at the export because Ultralytics would then run the encoder on the detector's PyTorch device and couldn't target the benchmarked OpenVINO device.
+If the hook point is missing, the config sets an explicit `model:`, or anything fails, tracking keeps the source config and Ultralytics' default Re-ID. A hook is used instead of only pointing `model:` at the export because Ultralytics would then run the encoder on the detector's PyTorch device and couldn't target the benchmarked OpenVINO device.
 
-Newer tracker options in Ultralytics (not enabled here): `tracker_type` `tracktrack` (Ultralytics' default), `ocsort`, `deepocsort`, `fasttrack`, and dedicated Re-ID models `yolo26{n,s,m,l,x}-reid.onnx` (448 px). Setting one of those as `model:` bypasses the OpenVINO encoder and runs it through Ultralytics directly.
+Ultralytics also ships dedicated Re-ID models `yolo26{n,s,m,l,x}-reid.onnx` (448 px), not used here. Setting one as `model:` bypasses the OpenVINO encoder and runs it through Ultralytics directly.
 
 ## Database
 
