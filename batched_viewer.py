@@ -472,7 +472,7 @@ def batch_detection_thread():
                 # GPU metrics if available
                 if USE_GPU and torch.cuda.is_available():
                     try:
-                        memory_allocated = torch.cuda.memory_allocated() / 1024 / 1024  # MB
+                        memory_allocated = torch.cuda.memory_allocated(BACKEND.device) / 1024 / 1024  # MB
                         performance_metrics['memory_usage'].append({
                             'timestamp': time.time(),
                             'memory': memory_allocated
