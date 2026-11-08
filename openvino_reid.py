@@ -23,6 +23,7 @@ Ultralytics' default.
 from __future__ import annotations
 
 import json
+import shutil
 import statistics
 import time
 from pathlib import Path
@@ -77,18 +78,30 @@ class OpenVINOReID:
         return [np.asarray(next(rows), dtype=np.float32) if keep else None for keep in valid]
 
 
-def export_encoder(weights: str = REID_WEIGHTS) -> Path:
-    """Export the classifier backbone + pooling to OpenVINO IR (dynamic batch), once. Returns the model directory."""
+def export_encoder(weights: str = REID_WEIGHTS, force: bool = False) -> Path:
+    """Export the classifier backbone + pooling to OpenVINO IR (dynamic batch). Returns the model directory.
+
+    Re-exports when the source weights' contents change (their hash is stored in reid.json) or when forced.
+    """
     import openvino as ov
     from ultralytics import YOLO
 
+    from inference_backend import resolve_weights, weights_id
+
     stem = Path(weights).stem
     target = CACHE_DIR / f'{stem}_reid_openvino_model'
-    if (target / 'reid.json').exists():
-        return target
+    source_id = weights_id(weights)
+    if not force:
+        try:
+            if json.loads((target / 'reid.json').read_text(encoding='utf-8')).get('weights_id') == source_id:
+                return target
+        except (OSError, ValueError):
+            pass
 
     print(f"[INFO] Exporting {weights} Re-ID encoder to OpenVINO (one-time)...")
-    cls_model = YOLO(weights).model.float().fuse().eval()  # fuse() matches what Ultralytics runs at predict time
+    if target.exists():
+        shutil.rmtree(target)
+    cls_model = YOLO(str(resolve_weights(weights))).model.float().fuse().eval()  # fuse() matches Ultralytics' predict path
     layers = cls_model.model
     if type(layers[-1]).__name__ != 'Classify' or not all(layer.f == -1 for layer in layers):
         raise RuntimeError(f'{weights} is not a plain sequential classifier; cannot export a Re-ID encoder')
@@ -101,7 +114,8 @@ def export_encoder(weights: str = REID_WEIGHTS) -> Path:
     target.mkdir(parents=True, exist_ok=True)
     xml = f'{stem}_reid.xml'
     ov.save_model(ov_model, target / xml, compress_to_fp16=True)
-    (target / 'reid.json').write_text(json.dumps({'xml': xml, 'imgsz': imgsz, 'source': weights}), encoding='utf-8')
+    info = {'xml': xml, 'imgsz': imgsz, 'source': weights, 'weights_id': source_id}
+    (target / 'reid.json').write_text(json.dumps(info), encoding='utf-8')  # written last: marks a complete export
     return target
 
 

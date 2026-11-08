@@ -152,8 +152,8 @@ All config is in `.env`. Key settings:
 | `REOLINK_USERNAME` | `admin` | NVR login |
 | `REOLINK_PASSWORD` | (required) | NVR password |
 | `YOLO_MODEL` | `yolo26n.pt` | Detection model (downloaded automatically) |
-| `YOLO_DEVICE` | `auto` | `auto` picks the fastest backend on this PC (see below); or force `cpu`, `cuda`, `intel:gpu`, `intel:cpu`, `intel:npu` |
-| `YOLO_REBENCHMARK` | `0` | `1` re-runs the backend benchmark on the next start |
+| `YOLO_DEVICE` | `auto` | `auto` picks the fastest backend on this PC (see below); or force `cpu`, `cuda` / `cuda:N` / `N` (NVIDIA GPU N), `intel:gpu`, `intel:cpu`, `intel:npu` |
+| `YOLO_REBENCHMARK` | `0` | `1` re-exports the OpenVINO models and re-runs the backend benchmark on the next start |
 | `TRACKER_CONFIG` | `surveillance_tracker.yaml` | Tracker config file (`botsort_tracker.yaml` for BoT-SORT) |
 | `YOLO_CONFIDENCE` | `0.5` | Minimum detection confidence |
 
@@ -218,10 +218,10 @@ Set `YOLO_MODEL=yolo26s.pt` (or m/l/x) in `.env`. The model downloads automatica
 `inference_backend.py` decides how YOLO runs, once per PC, when `YOLO_DEVICE=auto`:
 
 1. **NVIDIA GPU** visible to PyTorch → PyTorch on CUDA (or `<model>_batch4.engine` if a TensorRT engine exists). No benchmark.
-2. **OpenVINO installed** → exports the model to OpenVINO IR (batch 1 and batch 4, FP16) into `model_cache/`, then times PyTorch-CPU against OpenVINO on every Intel device (iGPU/Arc GPU, CPU, NPU) on a 4-frame batch. OpenVINO is used only if it is at least 15% faster (`MIN_SPEEDUP`).
+2. **OpenVINO installed** → exports the model to OpenVINO IR (batch 1 and batch 4, FP16) into `model_cache/<name>-<weights hash>_b<N>_openvino_model/`, then times PyTorch-CPU against OpenVINO on every Intel device (iGPU/Arc GPU, CPU, NPU) on a 4-frame batch. OpenVINO is used only if it is at least 15% faster (`MIN_SPEEDUP`).
 3. Otherwise → PyTorch on the CPU.
 
-The decision is cached in `model_cache/backend_choice.json`, keyed by hostname, hardware and library versions, so the same checkout works across PCs. OpenVINO models have a fixed batch size: `BACKEND.predict_batch()` pads partial batches (e.g. a camera offline), and sequential mode and tracking use the batch-1 export. The active backend is exposed as `inference_backend` in `GET /get_config` and shown in the dashboard header.
+Exports and the cached decision are keyed by a hash of the weights file's contents, so replacing the weights (e.g. a retrained `best.pt`) or pointing `YOLO_MODEL` at another file with the same name exports and benchmarks again instead of reusing a stale model. The decision is cached in `model_cache/backend_choice.json`, keyed by hostname, hardware, library versions and that weights hash, so the same checkout works across PCs. OpenVINO models have a fixed batch size: `BACKEND.predict_batch()` pads partial batches (e.g. a camera offline), and sequential mode and tracking use the batch-1 export. The active backend is exposed as `inference_backend` in `GET /get_config` and shown in the dashboard header.
 
 **Tracking Re-ID.** With YOLO26 (end-to-end head), the trackers' `model: auto` can't reuse detector features, so Ultralytics runs a separate `yolo26n-cls.pt` encoder on a crop of every detected object. The same one-time benchmark times that encoder (PyTorch vs OpenVINO per device, for 1 and 4 objects). Where OpenVINO is at least 15% faster, `BACKEND.tracker_config()`:
 1. exports the classifier backbone + average pooling to `model_cache/yolo26n-cls_reid_openvino_model/` (same embedding as Ultralytics' path, cosine similarity 1.0),

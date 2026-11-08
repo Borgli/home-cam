@@ -23,10 +23,12 @@ YOLO_DEVICE can also force a backend:
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import statistics
 import time
@@ -55,7 +57,7 @@ class InferenceBackend:
     """How to load and run the detector on this machine."""
 
     kind: str            # 'pytorch' | 'openvino' | 'tensorrt'
-    device: str          # passed to predict()/track(): 'cpu', 'cuda', 'intel:gpu', ...
+    device: str          # passed to predict()/track(): 'cpu', 'cuda:0', 'intel:gpu', ...
     label: str           # human-readable, shown in the dashboard
     batch_weights: str   # weights for a batch of frames (batched mode)
     single_weights: str  # weights for one frame at a time (sequential mode, tracking)
@@ -68,7 +70,7 @@ class InferenceBackend:
 
     @property
     def uses_cuda(self) -> bool:
-        return self.device == 'cuda'
+        return self.device.startswith('cuda')
 
     def tracker_config(self, base_yaml: str) -> str:
         """Tracker config to use: base_yaml, or a generated copy that runs Re-ID on OpenVINO (see openvino_reid.py)."""
@@ -140,11 +142,17 @@ def select_backend(model_name: str, batch_size: int = 4) -> InferenceBackend:
                       "Set YOLO_DEVICE=auto to let the app pick a faster backend if there is one.")
             return cpu_backend(model_name, 'YOLO_DEVICE=cpu in .env')
 
-        if requested in ('cuda', 'gpu') or requested.startswith('cuda:') or requested.isdigit():
-            if torch.cuda.is_available():
-                return _cuda_backend(model_name, batch_size, f'YOLO_DEVICE={requested} in .env')
-            print(f"[WARN] YOLO_DEVICE={requested}, but PyTorch can't see an NVIDIA GPU. Choosing automatically.")
-            return _auto(model_name, batch_size)
+        cuda_index = _cuda_index(requested)
+        if cuda_index is not None:
+            if not torch.cuda.is_available():
+                print(f"[WARN] YOLO_DEVICE={requested}, but PyTorch can't see an NVIDIA GPU. Choosing automatically.")
+                return _auto(model_name, batch_size)
+            count = torch.cuda.device_count()
+            if cuda_index >= count:
+                print(f"[WARN] YOLO_DEVICE={requested}, but only {count} NVIDIA GPU(s) found "
+                      f"(indexes 0-{count - 1}). Choosing automatically.")
+                return _auto(model_name, batch_size)
+            return _cuda_backend(model_name, batch_size, f'YOLO_DEVICE={requested} in .env', cuda_index)
 
         if requested.startswith('intel:'):
             backend = _forced_openvino(model_name, batch_size, requested)
@@ -168,7 +176,7 @@ def cpu_backend(model_name: str, reason: str) -> InferenceBackend:
 
 def _auto(model_name: str, batch_size: int) -> InferenceBackend:
     if torch.cuda.is_available():
-        return _cuda_backend(model_name, batch_size, f'NVIDIA GPU found ({torch.cuda.get_device_name(0)})')
+        return _cuda_backend(model_name, batch_size, f'NVIDIA GPU found ({torch.cuda.get_device_name(0)})', 0)
 
     ov = _import_openvino()
     if ov is None:
@@ -189,6 +197,7 @@ def _auto(model_name: str, batch_size: int) -> InferenceBackend:
         'versions': {'openvino': ov.__version__.split('-')[0], 'ultralytics': ultralytics.__version__,
                      'torch': torch.__version__},
         'model': Path(model_name).name,
+        'weights': weights_id(model_name),  # content hash: retrained weights with the same name measure again
         'batch_size': batch_size,
     }
     key = hashlib.sha1(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:16]
@@ -201,11 +210,11 @@ def _auto(model_name: str, batch_size: int) -> InferenceBackend:
         print(f"[INFO] Using cached backend benchmark from {entry['measured_at']} "
               f"(set YOLO_REBENCHMARK=1 to measure again)")
     else:
-        entry = _benchmark(model_name, batch_size, ov_devices)
+        entry = _benchmark(model_name, batch_size, ov_devices, force_export=rebenchmark)
         entry['fingerprint'] = fingerprint
         changed = True
     if 'reid' not in entry:
-        reid = _benchmark_reid(ov_devices)
+        reid = _benchmark_reid(ov_devices, force_export=rebenchmark)
         if reid is not None:  # not cached on failure, so it is retried next start
             entry['reid'] = reid
             changed = True
@@ -233,11 +242,11 @@ def _auto(model_name: str, batch_size: int) -> InferenceBackend:
     return backend
 
 
-def _benchmark_reid(ov_devices: dict) -> dict | None:
+def _benchmark_reid(ov_devices: dict, force_export: bool = False) -> dict | None:
     """Time the tracker's Re-ID encoder (1 and 4 objects): Ultralytics' PyTorch path vs OpenVINO per device."""
     try:
         import openvino_reid
-        model_dir = openvino_reid.export_encoder()
+        model_dir = openvino_reid.export_encoder(force=force_export)
         one = openvino_reid.benchmark(model_dir, list(ov_devices), n_crops=1)
         four = openvino_reid.benchmark(model_dir, list(ov_devices), n_crops=4)
     except Exception as e:  # noqa: BLE001 - Re-ID acceleration is optional
@@ -257,12 +266,12 @@ def _benchmark_reid(ov_devices: dict) -> dict | None:
     return {'choice': choice, 'timings_ms': timings, 'crops': [1, 4]}
 
 
-def _benchmark(model_name: str, batch_size: int, ov_devices: dict) -> dict:
+def _benchmark(model_name: str, batch_size: int, ov_devices: dict, force_export: bool = False) -> dict:
     """Time PyTorch-CPU against OpenVINO on each Intel device; return the cache entry."""
-    print(f"[INFO] First run on this PC with {Path(model_name).name}: benchmarking backends "
+    print(f"[INFO] Benchmarking backends for {Path(model_name).name} on this PC "
           f"(about a minute, cached afterwards)...")
-    _export_openvino(model_name, 1)  # used later for sequential mode and tracking
-    bn = _export_openvino(model_name, batch_size)
+    _export_openvino(model_name, 1, force=force_export)  # used later for sequential mode and tracking
+    bn = _export_openvino(model_name, batch_size, force=force_export)
 
     rng = np.random.default_rng(0)
     frames = [rng.integers(0, 256, BENCH_FRAME_SHAPE, dtype=np.uint8) for _ in range(batch_size)]
@@ -310,14 +319,32 @@ def _benchmark(model_name: str, batch_size: int, ov_devices: dict) -> dict:
 # Backend builders
 # --------------------------------------------------------------------------- #
 
-def _cuda_backend(model_name: str, batch_size: int, reason: str) -> InferenceBackend:
-    label = f'PyTorch · {torch.cuda.get_device_name(0)}'
-    engine = f"{Path(model_name).stem}_batch{batch_size}.engine"
-    if os.path.exists(engine):
-        # A TensorRT engine exported with dynamic=True accepts any batch up to batch_size.
-        return InferenceBackend('tensorrt', 'cuda', f'TensorRT · {torch.cuda.get_device_name(0)}',
-                                engine, model_name, 0, f'{reason}; using TensorRT engine {engine}')
-    return InferenceBackend('pytorch', 'cuda', label, model_name, model_name, 0, reason)
+def _cuda_index(requested: str) -> int | None:
+    """GPU index from a YOLO_DEVICE value: 'cuda'/'gpu' -> 0, 'cuda:N' or 'N' -> N; None if not a CUDA value."""
+    if requested in ('cuda', 'gpu'):
+        return 0
+    if requested.startswith('cuda:') and requested[5:].isdigit():
+        return int(requested[5:])
+    if requested.isdigit():
+        return int(requested)
+    return None
+
+
+def _cuda_backend(model_name: str, batch_size: int, reason: str, index: int) -> InferenceBackend:
+    device = f'cuda:{index}'
+    gpu = torch.cuda.get_device_name(index)
+    if torch.cuda.device_count() > 1:
+        gpu += f' (GPU {index})'
+    engine = Path(f"{Path(model_name).stem}_batch{batch_size}.engine")
+    if engine.exists():
+        weights = Path(model_name)
+        if weights.is_file() and engine.stat().st_mtime < weights.stat().st_mtime:
+            print(f"[WARN] {engine} is older than {weights}; ignoring it (re-export the TensorRT engine to use it).")
+        else:
+            # A TensorRT engine exported with dynamic=True accepts any batch up to batch_size.
+            return InferenceBackend('tensorrt', device, f'TensorRT · {gpu}',
+                                    str(engine), model_name, 0, f'{reason}; using TensorRT engine {engine}')
+    return InferenceBackend('pytorch', device, f'PyTorch · {gpu}', model_name, model_name, 0, reason)
 
 
 def _openvino_backend(model_name: str, batch_size: int, device: str, ov_devices: dict, reason: str) -> InferenceBackend:
@@ -353,22 +380,58 @@ def _forced_openvino(model_name: str, batch_size: int, requested: str) -> Infere
 # Helpers
 # --------------------------------------------------------------------------- #
 
-def _export_openvino(model_name: str, batch: int) -> str:
-    """Export model_name to an OpenVINO IR with a fixed batch size, once. Returns the model directory."""
+def _export_openvino(model_name: str, batch: int, force: bool = False) -> str:
+    """Export model_name to an OpenVINO IR with a fixed batch size, once per weights file. Returns the model directory.
+
+    The folder name includes a hash of the weights' contents, so replacing the weights (e.g. a retrained best.pt)
+    or pointing YOLO_MODEL at another file with the same name exports again instead of reusing a stale model.
+    """
+    stem, wid = Path(model_name).stem, weights_id(model_name)
     # Ultralytics recognises OpenVINO models by the '_openvino_model' folder suffix.
-    target = CACHE_DIR / f"{Path(model_name).stem}_b{batch}_openvino_model"
-    if _exported_with_current_ultralytics(target):
+    target = CACHE_DIR / f"{stem}-{wid}_b{batch}_openvino_model"
+    if not force and _exported_with_current_ultralytics(target):
         return str(target)
     print(f"[INFO] Exporting {Path(model_name).name} to OpenVINO (batch {batch}, one-time)...")
     CACHE_DIR.mkdir(exist_ok=True)
     from ultralytics.cfg import DEFAULT_CFG_DICT
     fp16 = {'quantize': 16} if 'quantize' in DEFAULT_CFG_DICT else {'half': True}  # 'half' is deprecated in newer versions
-    exported = YOLO(model_name).export(format='openvino', batch=batch, imgsz=EXPORT_IMGSZ,
-                                       dynamic=False, verbose=False, **fp16)
+    exported = YOLO(str(resolve_weights(model_name))).export(format='openvino', batch=batch, imgsz=EXPORT_IMGSZ,
+                                                             dynamic=False, verbose=False, **fp16)
     if target.exists():
         shutil.rmtree(target)
     shutil.move(str(exported), str(target))
+
+    # Drop exports of earlier weights with this name and batch (and the old un-hashed layout).
+    stale = re.compile(rf'^{re.escape(stem)}(-[0-9a-f]{{12}})?_b{batch}_openvino_model$')
+    for old in CACHE_DIR.iterdir():
+        if old != target and old.is_dir() and stale.match(old.name):
+            shutil.rmtree(old, ignore_errors=True)
     return str(target)
+
+
+def resolve_weights(model_name: str) -> Path:
+    """Local path of a weights file; official Ultralytics names (e.g. yolo26n.pt) are downloaded if missing."""
+    path = Path(model_name)
+    if path.is_file():
+        return path.resolve()
+    from ultralytics.utils.downloads import attempt_download_asset
+    return Path(attempt_download_asset(model_name)).resolve()
+
+
+def weights_id(model_name: str) -> str:
+    """Short hash of a weights file's contents, used to key exports and benchmarks to the actual weights."""
+    path = resolve_weights(model_name)
+    stat = path.stat()
+    return _file_sha256(str(path), stat.st_size, stat.st_mtime_ns)[:12]
+
+
+@functools.lru_cache(maxsize=16)
+def _file_sha256(path: str, size: int, mtime_ns: int) -> str:  # size/mtime only key the cache
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _exported_with_current_ultralytics(model_dir: Path) -> bool:
