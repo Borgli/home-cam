@@ -30,7 +30,7 @@ import platform
 import shutil
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -63,6 +63,8 @@ class InferenceBackend:
     reason: str          # why this backend was chosen
     reid_device: str | None = None  # OpenVINO device for tracking Re-ID ('intel:gpu', ...); None = Ultralytics default
     reid_label: str = 'Ultralytics default (PyTorch)'
+    benchmark: list = field(default_factory=list)       # [{'name', 'ms', 'chosen'}] detector timings on this PC
+    reid_benchmark: list = field(default_factory=list)  # same for the Re-ID encoder
 
     @property
     def uses_cuda(self) -> bool:
@@ -86,6 +88,8 @@ class InferenceBackend:
         except Exception as e:  # noqa: BLE001 - tracking must work even if the OpenVINO encoder can't be set up
             print(f"[WARN] Could not set up OpenVINO Re-ID ({type(e).__name__}: {e}); Re-ID stays on PyTorch.")
         self.reid_device = None
+        for row in self.reid_benchmark:  # the measured winner isn't in use, so mark what actually runs
+            row['chosen'] = row['name'].startswith('PyTorch')
         return base_yaml
 
     def load_models(self) -> tuple[YOLO, YOLO]:
@@ -113,7 +117,7 @@ class InferenceBackend:
 
     def to_dict(self) -> dict:
         return {'kind': self.kind, 'device': self.device, 'label': self.label, 'reason': self.reason,
-                'reid': self.reid_label}
+                'reid': self.reid_label, 'benchmark': self.benchmark, 'reid_benchmark': self.reid_benchmark}
 
     def _load(self, weights: str) -> YOLO:
         model = YOLO(weights, task='detect')
@@ -217,9 +221,15 @@ def _auto(model_name: str, batch_size: int) -> InferenceBackend:
     else:
         backend = _openvino_backend(model_name, batch_size, choice, ov_devices,
                                     f'fastest on this PC: {summary} per {batch_size} frames')
-    reid_choice = (entry.get('reid') or {}).get('choice', 'pytorch')
+    reid = entry.get('reid') or {}
+    reid_choice = reid.get('choice', 'pytorch')
     if reid_choice != 'pytorch':
         backend.reid_device = reid_choice
+    backend.benchmark = [{'name': _device_title(d, ov_devices), 'ms': ms, 'chosen': d == choice}
+                         for d, ms in sorted(timings.items(), key=lambda kv: kv[1])]
+    backend.reid_benchmark = [{'name': 'PyTorch (Ultralytics default)' if d == 'pytorch' else _device_title(d, ov_devices),
+                               'ms': ms, 'chosen': d == reid_choice}
+                              for d, ms in sorted(reid.get('timings_ms', {}).items(), key=lambda kv: kv[1])]
     return backend
 
 
