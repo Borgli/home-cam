@@ -13,10 +13,14 @@ redis>=5.2.0
 
 # Computer Vision
 opencv-python>=4.11.0.86
-ultralytics>=8.3.0
+ultralytics>=8.4.208  # tested version; adds OC-SORT/Deep OC-SORT/TrackTrack and fixed ReID
+lap>=0.5.12  # needed by Ultralytics trackers (BoT-SORT/ByteTrack)
 torch>=2.5.0
 torchvision>=0.20.0
 numpy>=2.0.0
+# Intel acceleration (CPU, integrated/Arc GPU, NPU). Only used when a startup
+# benchmark shows it is faster than PyTorch on this PC - see inference_backend.py
+openvino>=2025.0; platform_machine != "ARM64"
 
 # LLM & AI
 langchain>=0.3.7
@@ -27,6 +31,7 @@ sentence-transformers>=3.3.0
 
 # Web Framework
 flask>=3.1.0
+flask-cors>=6.0.0
 
 # Utilities
 python-dotenv>=1.0.1
@@ -35,5 +40,5 @@ pydantic-settings>=2.6.0
 websockets>=13.1
 Pillow>=11.0.0
 requests>=2.32.3
-supervision>=0.27.0
+supervision>=0.31.0
 reolinkapi>=0.1.0

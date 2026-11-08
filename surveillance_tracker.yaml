@@ -1,13 +1,24 @@
-# BoT-SORT tracker config optimized for fixed surveillance cameras
-tracker_type: botsort
-track_high_thresh: 0.3        # High confidence threshold for first-frame associations
-track_low_thresh: 0.1         # Low confidence threshold for second-round matching
-new_track_thresh: 0.3         # Minimum confidence to start a new track
-track_buffer: 90              # ~8 seconds at 11fps - keep lost tracks in memory
-match_thresh: 0.75            # IoU matching threshold
-fuse_score: true              # Fuse detection confidence into matching cost
-gmc_method: none              # No motion compensation - cameras are fixed
-with_reid: true               # Appearance-based re-identification (the key feature)
-model: auto                   # Reuse YOLO backbone features - zero extra overhead
-proximity_thresh: 0.3         # Spatial proximity threshold for Re-ID
-appearance_thresh: 0.5        # Appearance similarity threshold for Re-ID
+# TrackTrack (CVPR 2025) + Re-ID, tuned for fixed surveillance cameras - the default tracker.
+# Chosen over BoT-SORT + Re-ID after running both on the same recorded footage from all 4 cameras:
+# fewer IDs created (4 vs 10), no re-labelled objects, the same coverage, and about half the cost.
+# The previous BoT-SORT setup is in botsort_tracker.yaml (select it with TRACKER_CONFIG in .env).
+tracker_type: tracktrack
+track_high_thresh: 0.5        # First-round matching threshold; matches the app's 0.5 confidence filter (default 0.6)
+track_low_thresh: 0.25        # Low-confidence detections still used for second-round matching
+new_track_thresh: 0.5         # Start a track at 0.5 (default 0.7 left ~10% of confident night detections untracked)
+track_buffer: 90              # Keep lost tracks for 90 processed frames (default 30)
+match_thresh: 0.7             # Matching cost threshold
+lost_match_thr: 0.0           # Relaxed lost-track rebinding pass; 0 disables it
+iou_weight: 0.5               # Weight of the box-overlap distance
+reid_weight: 0.5              # Weight of the appearance (Re-ID) distance
+conf_weight: 0.1              # Weight of the confidence distance
+angle_weight: 0.05            # Weight of the corner-angle distance
+penalty_p: 0.2                # Cost penalty for low-confidence detections
+penalty_q: 0.4                # Cost penalty for detections recovered by secondary NMS
+reduce_step: 0.05             # Match-threshold relaxation per iteration
+tai_thr: 0.55                 # Track-aware initialization: suppress new tracks overlapping existing ones
+min_track_len: 3              # Frames before a new track is confirmed (filters one-off false positives)
+gmc_method: none              # No motion compensation - cameras are fixed (default sparseOptFlow)
+with_reid: true               # Appearance-based re-identification
+model: auto                   # YOLO26 can't share detector features, so this runs yolo26n-cls.pt per object;
+                              # on Intel PCs openvino_reid.py moves it to OpenVINO when that's faster
