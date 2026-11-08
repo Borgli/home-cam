@@ -5,7 +5,7 @@ AI-powered surveillance system with real-time object detection, tracking, and a 
 ## Features
 
 - **YOLO26 Object Detection** - Real-time detection with 80 COCO classes on live camera feeds
-- **BoT-SORT Tracking with Re-ID** - Appearance-based re-identification so tracked objects keep their IDs even after temporary occlusion
+- **TrackTrack Tracking with Re-ID** - Appearance-based re-identification so tracked objects keep their IDs even after temporary occlusion
 - **4-Camera Grid** - Monitor up to 4 NVR channels simultaneously with zoom and fullscreen
 - **Drawing Tools** - Privacy zones, counting zones, and crossing lines drawn directly on camera feeds
 - **Privacy Zone Masking** - Drawn privacy zones are applied server-side before detection, truly hiding regions from YOLO
@@ -54,8 +54,10 @@ REOLINK_IP=192.168.2.112
 REOLINK_USERNAME=admin
 REOLINK_PASSWORD=your_password
 YOLO_MODEL=yolo26n.pt
-YOLO_DEVICE=cpu               # or cuda for GPU
+YOLO_DEVICE=auto              # or cpu | cuda | intel:gpu | intel:cpu | intel:npu
 ```
+
+With `YOLO_DEVICE=auto` each PC picks its own inference backend at startup: an NVIDIA GPU (CUDA) if there is one, otherwise OpenVINO on Intel hardware when a short benchmark shows it is faster than PyTorch on the CPU, otherwise PyTorch on the CPU. The first start on a PC exports the model to OpenVINO and benchmarks (about a minute); the result is cached in `model_cache/`. The dashboard header shows which backend is in use.
 
 ### Running
 
@@ -96,7 +98,7 @@ Privacy Zone Masking (black out regions before detection)
     |
     v
 YOLO26 Detection (batched or per-camera with tracking)
-    |--- BoT-SORT + Re-ID tracking (persist=True per camera)
+    |--- TrackTrack + Re-ID tracking (persist=True per camera)
     |--- DetectionsSmoother (reduces box jitter)
     |--- TraceAnnotator (movement trails)
     |
@@ -114,7 +116,7 @@ Flask Backend (REST API + MJPEG)     React Frontend (Vite + Tailwind)
 home-cam/
 ├── batched_viewer.py            # Main backend: cameras, detection, tracking, API
 ├── simple_viewer.py             # Simpler single-process viewer (no tracking)
-├── surveillance_tracker.yaml    # BoT-SORT + Re-ID tracker config
+├── surveillance_tracker.yaml    # TrackTrack + Re-ID tracker config (botsort_tracker.yaml: alternative)
 ├── requirements.txt             # Python dependencies
 ├── .env                         # Configuration (not in git)
 ├── .env.example                 # Configuration template
@@ -158,7 +160,7 @@ home-cam/
 | `/` | GET | Legacy 4-camera HTML view |
 | `/video_feed/<channel>` | GET | MJPEG stream (0-3) |
 | `/toggle_detection` | POST | Toggle YOLO detection on/off |
-| `/toggle_tracking` | POST | Toggle BoT-SORT + Re-ID tracking |
+| `/toggle_tracking` | POST | Toggle object tracking (TrackTrack + Re-ID) |
 | `/toggle_batched_mode` | POST | Toggle batched vs sequential inference |
 | `/toggle_auto_fps` | POST | Toggle automatic FPS detection |
 | `/set_target_fps` | POST | Set manual target FPS (1-60) |
@@ -198,12 +200,14 @@ Set via `YOLO_MODEL` in `.env`. Models are downloaded automatically on first run
 
 ## Tracker Configuration
 
-The `surveillance_tracker.yaml` configures BoT-SORT for fixed surveillance cameras:
+The `surveillance_tracker.yaml` configures TrackTrack for fixed surveillance cameras:
 
-- **with_reid: true** - Appearance-based re-identification
-- **model: auto** - Reuses YOLO backbone features (zero extra overhead)
+- **with_reid: true** - Appearance-based re-identification (runs on OpenVINO on Intel PCs when that's faster)
+- **track_high_thresh / new_track_thresh: 0.5** - Matches the app's 0.5 confidence filter
 - **gmc_method: none** - No motion compensation (cameras are fixed)
-- **track_buffer: 90** - Keep lost tracks for ~8 seconds
+- **track_buffer: 90** - Keep lost tracks for 90 processed frames
+
+TrackTrack replaced BoT-SORT after a comparison on recorded footage from all four cameras (fewer IDs, no re-labelled objects, about half the cost). The BoT-SORT setup is kept in `botsort_tracker.yaml`; select it with `TRACKER_CONFIG=botsort_tracker.yaml` in `.env`.
 
 ## Database Schema
 
@@ -233,4 +237,4 @@ MIT License - See LICENSE file
 - [Ollama](https://ollama.com) - Local LLM runtime
 - [reolinkapi](https://github.com/ReolinkCameraAPI/reolinkapipy) - NVR integration
 
-**Built with:** Flask, React, Vite, Tailwind CSS, YOLO26, BoT-SORT, Recharts, Konva, Zustand, SQLite, Ollama
+**Built with:** Flask, React, Vite, Tailwind CSS, YOLO26, TrackTrack, OpenVINO, Recharts, Konva, Zustand, SQLite, Ollama
